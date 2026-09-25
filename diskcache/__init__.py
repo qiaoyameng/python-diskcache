@@ -10,6 +10,7 @@ from .core import (
     ENOVAL,
     EVICTION_POLICY,
     UNKNOWN,
+    BackupError,
     Cache,
     Disk,
     EmptyDirWarning,
@@ -31,6 +32,7 @@ from .recipes import (
 
 __all__ = [
     'Averager',
+    'BackupError',
     'BoundedSemaphore',
     'Cache',
     'DEFAULT_SETTINGS',

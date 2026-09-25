@@ -1,16 +1,32 @@
 """Fanout cache automatically shards keys and values."""
 
 import contextlib as cl
+import errno
 import functools
 import itertools as it
+import json
 import operator
+import os
 import os.path as op
+import shutil
 import sqlite3
 import tempfile
 import time
 
-from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
+from .core import (
+    BACKUP_VERSION,
+    DEFAULT_SETTINGS,
+    ENOVAL,
+    MANIFEST,
+    BackupError,
+    Cache,
+    Disk,
+    Timeout,
+)
 from .persistent import Deque, Index
+
+
+FANOUT_BACKUP_FORMAT = 'diskcache-fanout-backup'
 
 
 class FanoutCache:
@@ -407,6 +423,164 @@ class FanoutCache:
         """
         warnings = (shard.check(fix, retry) for shard in self._shards)
         return functools.reduce(operator.iadd, warnings, [])
+
+    def backup(self, path):
+        """Backup cache to directory at `path` with consistency guarantees.
+
+        Each shard is backed up independently with the consistency
+        guarantees of :meth:`Cache.backup <diskcache.Cache.backup>`. The
+        consistency boundary is a per-shard snapshot: each shard directory
+        in the backup corresponds to a single logical moment for that
+        shard, but different shards may correspond to different moments.
+
+        Contents are written to a temporary directory and atomically
+        renamed to `path` only after all shard backups and a manifest
+        recording the format version and shard count have completed.
+        Temporary directories therefore never count as completed backups.
+
+        Raises :exc:`FileExistsError` if `path` already exists and
+        :exc:`BackupError` if a shard backup cannot be obtained.
+
+        >>> cache = FanoutCache(shards=4)
+        >>> _ = cache.set('key', 'value')
+        >>> directory = tempfile.mkdtemp()
+        >>> cache.backup(op.join(directory, 'backup'))
+        >>> restored = FanoutCache.restore(
+        ...     op.join(directory, 'backup'),
+        ...     op.join(directory, 'restored'),
+        ... )
+        >>> restored['key']
+        'value'
+        >>> restored.close()
+        >>> cache.close()
+
+        :param str path: path of new backup directory
+        :raises BackupError: if a shard backup cannot be obtained
+        :raises FileExistsError: if `path` already exists
+
+        """
+        path = str(path)
+        path = op.expanduser(path)
+        path = op.expandvars(path)
+
+        if op.lexists(path):
+            raise FileExistsError(errno.EEXIST, 'backup path exists', path)
+
+        parent = op.dirname(op.abspath(path))
+
+        with cl.suppress(OSError):
+            os.makedirs(parent)
+
+        tmp = tempfile.mkdtemp(prefix='.diskcache-fanout-backup-', dir=parent)
+
+        try:
+            for num, shard in enumerate(self._shards):
+                shard.backup(op.join(tmp, '%03d' % num))
+
+            manifest = {
+                'format': FANOUT_BACKUP_FORMAT,
+                'version': BACKUP_VERSION,
+                'created': time.time(),
+                'shards': self._count,
+            }
+
+            manifest_path = op.join(tmp, MANIFEST)
+            with open(manifest_path, 'w', encoding='utf-8') as writer:
+                json.dump(manifest, writer, sort_keys=True)
+
+            # Atomically publish the completed backup.
+
+            os.rename(tmp, path)
+            tmp = None
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    @classmethod
+    def restore(cls, path, directory, **kwargs):
+        """Restore cache from backup at `path` to new `directory`.
+
+        The manifest and every shard backup are verified, including
+        SHA-256 checksums of all databases and external value files,
+        before anything is written to `directory`. If any referenced file
+        is missing or corrupt, the restore is refused with
+        :exc:`BackupError` and `directory` is left untouched.
+
+        An existing valid cache is never overwritten: if `directory`
+        exists and is not empty, :exc:`FileExistsError` is raised.
+
+        :param str path: path of backup directory
+        :param str directory: path of new cache directory
+        :param kwargs: additional keyword arguments for `FanoutCache`
+        :return: `FanoutCache` instance opened at `directory`
+        :raises BackupError: if the backup is invalid or incomplete
+        :raises FileExistsError: if `directory` is not empty
+
+        """
+        path = str(path)
+        path = op.expanduser(path)
+        path = op.expandvars(path)
+        directory = str(directory)
+        directory = op.expanduser(directory)
+        directory = op.expandvars(directory)
+
+        manifest_path = op.join(path, MANIFEST)
+
+        if not op.isfile(manifest_path):
+            raise BackupError('invalid backup, missing manifest: %s' % path)
+
+        with open(manifest_path, encoding='utf-8') as reader:
+            manifest = json.load(reader)
+
+        if manifest.get('format') != FANOUT_BACKUP_FORMAT:
+            raise BackupError('invalid backup format: %s' % path)
+
+        version = manifest.get('version')
+
+        if version != BACKUP_VERSION:
+            raise BackupError('unsupported backup version: %r' % (version,))
+
+        shards = manifest.get('shards')
+
+        if not isinstance(shards, int) or shards < 1:
+            raise BackupError('invalid shard count in backup: %s' % path)
+
+        kwargs.pop('shards', None)
+
+        # Never overwrite an existing valid cache.
+
+        if op.lexists(directory):
+            if not op.isdir(directory) or os.listdir(directory):
+                raise FileExistsError(
+                    errno.EEXIST, 'directory not empty', directory
+                )
+
+        parent = op.dirname(op.abspath(directory))
+
+        with cl.suppress(OSError):
+            os.makedirs(parent)
+
+        tmp = tempfile.mkdtemp(
+            prefix='.diskcache-fanout-restore-', dir=parent
+        )
+
+        try:
+            for num in range(shards):
+                shard_path = op.join(path, '%03d' % num)
+                shard_directory = op.join(tmp, '%03d' % num)
+                shard = Cache.restore(shard_path, shard_directory)
+                shard.close()
+
+            if op.isdir(directory):
+                os.rmdir(directory)  # Verified empty above.
+
+            os.rename(tmp, directory)
+            tmp = None
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        return cls(directory, shards=shards, **kwargs)
 
     def expire(self, retry=False):
         """Remove expired items from cache.

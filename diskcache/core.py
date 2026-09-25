@@ -5,12 +5,14 @@ import codecs
 import contextlib as cl
 import errno
 import functools as ft
+import hashlib
 import io
 import json
 import os
 import os.path as op
 import pickle
 import pickletools
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -36,6 +38,9 @@ class Constant(tuple):
 
 
 DBNAME = 'cache.db'
+MANIFEST = 'manifest.json'
+BACKUP_FORMAT = 'diskcache-backup'
+BACKUP_VERSION = 1
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
 
@@ -376,6 +381,10 @@ class Timeout(Exception):
     """Database timeout expired."""
 
 
+class BackupError(Exception):
+    """Backup is invalid, incomplete, or inconsistent."""
+
+
 class UnknownFileWarning(UserWarning):
     """Warning used by Cache.check for unknown files."""
 
@@ -412,6 +421,129 @@ def args_to_key(base, args, kwargs, typed, ignore):
             key += tuple(type(value) for _, value in sorted_items)
 
     return key
+
+
+def _hash_file(path, chunk_size=2**20):
+    """Return (size, sha256 hexdigest) pair for file at `path`."""
+    digest = hashlib.sha256()
+    size = 0
+
+    with open(path, 'rb') as reader:
+        while True:
+            chunk = reader.read(chunk_size)
+
+            if not chunk:
+                return size, digest.hexdigest()
+
+            size += len(chunk)
+            digest.update(chunk)
+
+
+def _copy_file(source, destination, chunk_size=2**20):
+    """Copy file and return (size, sha256 hexdigest) pair of contents."""
+    with open(source, 'rb') as reader:
+        return _copy_fileobj(reader, destination, chunk_size)
+
+
+def _copy_fileobj(reader, destination, chunk_size=2**20):
+    """Copy from file object and return (size, sha256 hexdigest) pair."""
+    digest = hashlib.sha256()
+    size = 0
+
+    with open(destination, 'xb') as writer:
+        while True:
+            chunk = reader.read(chunk_size)
+
+            if not chunk:
+                return size, digest.hexdigest()
+
+            size += len(chunk)
+            digest.update(chunk)
+            writer.write(chunk)
+
+
+def _restore_backup(path, directory):
+    """Validate backup at `path` and copy contents to `directory`.
+
+    All references in the backup manifest are verified, including SHA-256
+    checksums of the database and every external value file, before anything
+    is written to `directory`.
+
+    """
+    path = str(path)
+    path = op.expanduser(path)
+    path = op.expandvars(path)
+    directory = str(directory)
+    directory = op.expanduser(directory)
+    directory = op.expandvars(directory)
+
+    manifest_path = op.join(path, MANIFEST)
+
+    if not op.isfile(manifest_path):
+        raise BackupError('invalid backup, missing manifest: %s' % path)
+
+    with open(manifest_path, encoding='utf-8') as reader:
+        manifest = json.load(reader)
+
+    if manifest.get('format') != BACKUP_FORMAT:
+        raise BackupError('invalid backup format: %s' % path)
+
+    version = manifest.get('version')
+
+    if version != BACKUP_VERSION:
+        raise BackupError('unsupported backup version: %r' % (version,))
+
+    database = manifest.get('database') or {}
+    files = manifest.get('files') or {}
+    entries = [(database.get('name', DBNAME), database)]
+    entries += sorted(files.items())
+
+    # Verify all references before writing to the new directory.
+
+    for name, meta in entries:
+        full_path = op.join(path, name)
+
+        if not op.isfile(full_path):
+            raise BackupError('missing file in backup: %s' % name)
+
+        size, checksum = _hash_file(full_path)
+
+        if size != meta.get('size') or checksum != meta.get('sha256'):
+            raise BackupError('checksum mismatch in backup: %s' % name)
+
+    # Never overwrite an existing valid cache.
+
+    if op.lexists(directory):
+        if not op.isdir(directory) or os.listdir(directory):
+            raise FileExistsError(
+                errno.EEXIST, 'directory not empty', directory
+            )
+
+    parent = op.dirname(op.abspath(directory))
+
+    with cl.suppress(OSError):
+        os.makedirs(parent)
+
+    tmp = tempfile.mkdtemp(prefix='.diskcache-restore-', dir=parent)
+
+    try:
+        for name, _ in entries:
+            source = op.join(path, name)
+            destination = op.join(tmp, name)
+
+            with cl.suppress(OSError):
+                os.makedirs(op.dirname(destination))
+
+            shutil.copyfile(source, destination)
+
+        if op.isdir(directory):
+            os.rmdir(directory)  # Verified empty above.
+
+        os.rename(tmp, directory)
+        tmp = None
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class Cache:
@@ -2018,6 +2150,215 @@ class Cache:
                         )
 
             return warns
+
+    def backup(self, path):
+        """Backup cache to directory at `path` with consistency guarantees.
+
+        The backup corresponds to a single logical moment: a consistent
+        snapshot of the SQLite database together with every external value
+        file referenced by that snapshot. Simply copying ``cache.db`` and
+        the value files while writes occur may capture a database that
+        references deleted files or omit files referenced by newer rows.
+        This method avoids such dangling references.
+
+        The bulk of the value files are copied without holding the
+        database write lock. Value files are immutable so a copied file
+        stays valid for any snapshot that references it. Writes are then
+        only briefly blocked while the final database snapshot is taken
+        and any remaining referenced files are opened. Open file handles
+        pin the contents so the actual copying happens after the lock is
+        released.
+
+        Contents are written to a temporary directory and atomically
+        renamed to `path` only after a manifest recording the format
+        version and SHA-256 checksums of all contents has been written.
+        Temporary directories therefore never count as completed backups.
+
+        Raises :exc:`FileExistsError` if `path` already exists and
+        :exc:`BackupError` if called from within a transaction.
+
+        >>> cache = Cache()
+        >>> _ = cache.set('key', 'value')
+        >>> directory = tempfile.mkdtemp()
+        >>> cache.backup(op.join(directory, 'backup'))
+        >>> restored = Cache.restore(
+        ...     op.join(directory, 'backup'),
+        ...     op.join(directory, 'restored'),
+        ... )
+        >>> restored['key']
+        'value'
+        >>> restored.close()
+        >>> cache.close()
+
+        :param str path: path of new backup directory
+        :raises BackupError: if called from within a transaction
+        :raises FileExistsError: if `path` already exists
+
+        """
+        if self._txn_id == threading.get_ident():
+            raise BackupError('cannot backup within a transaction')
+
+        path = str(path)
+        path = op.expanduser(path)
+        path = op.expandvars(path)
+
+        if op.lexists(path):
+            raise FileExistsError(errno.EEXIST, 'backup path exists', path)
+
+        parent = op.dirname(op.abspath(path))
+
+        with cl.suppress(OSError):
+            os.makedirs(parent)
+
+        tmp = tempfile.mkdtemp(prefix='.diskcache-backup-', dir=parent)
+
+        try:
+            copied = {}
+            snapshot = op.join(tmp, DBNAME)
+            select = (
+                'SELECT DISTINCT filename FROM Cache'
+                ' WHERE filename IS NOT NULL'
+            )
+
+            # First pass: snapshot the database using SQLite's online
+            # backup API and copy every referenced value file, all without
+            # holding the write lock. With the WAL journal mode, readers
+            # and writers are only briefly blocked while batches of pages
+            # are copied. Files deleted by concurrent writes before they
+            # can be copied are skipped; the second pass handles them.
+
+            target = sqlite3.connect(snapshot)
+
+            try:
+                self._con.backup(target)
+                rows = target.execute(select).fetchall()
+            finally:
+                target.close()
+
+            for (filename,) in rows:
+                source = op.join(self._directory, filename)
+                destination = op.join(tmp, filename)
+
+                with cl.suppress(OSError):
+                    os.makedirs(op.dirname(destination))
+
+                with cl.suppress(FileNotFoundError):
+                    copied[filename] = _copy_file(source, destination)
+
+            # Second pass: briefly hold the write lock so the database
+            # cannot change, snapshot it again, and open every referenced
+            # file not already copied. A file referenced by this snapshot
+            # is guaranteed to exist: its deleting transaction could not
+            # have committed while the write lock is held. The open file
+            # handles pin the contents so copying finishes after the lock
+            # is released.
+
+            handles = {}
+
+            with self._transact(retry=True):
+                source_con = sqlite3.connect(
+                    op.join(self._directory, DBNAME), timeout=self._timeout
+                )
+
+                try:
+                    target = sqlite3.connect(snapshot)
+
+                    try:
+                        source_con.backup(target)
+                        rows = target.execute(select).fetchall()
+                    finally:
+                        target.close()
+                finally:
+                    source_con.close()
+
+                filenames = {filename for (filename,) in rows}
+
+                for filename in filenames:
+                    if filename in copied:
+                        continue
+
+                    handles[filename] = open(
+                        op.join(self._directory, filename), 'rb'
+                    )
+
+            # Copy the pinned files now that the write lock is released.
+
+            for filename, reader in handles.items():
+                with reader:
+                    destination = op.join(tmp, filename)
+
+                    with cl.suppress(OSError):
+                        os.makedirs(op.dirname(destination))
+
+                    copied[filename] = _copy_fileobj(reader, destination)
+
+            # Remove files copied for the earlier, now-stale snapshot.
+
+            for filename in set(copied) - filenames:
+                with cl.suppress(OSError):
+                    os.remove(op.join(tmp, filename))
+                with cl.suppress(OSError):
+                    os.removedirs(op.dirname(op.join(tmp, filename)))
+                del copied[filename]
+
+            files = copied
+
+            size, checksum = _hash_file(snapshot)
+            manifest = {
+                'format': BACKUP_FORMAT,
+                'version': BACKUP_VERSION,
+                'created': time.time(),
+                'database': {
+                    'name': DBNAME,
+                    'size': size,
+                    'sha256': checksum,
+                },
+                'files': {
+                    name: {'size': file_size, 'sha256': file_checksum}
+                    for name, (file_size, file_checksum) in files.items()
+                },
+            }
+
+            manifest_path = op.join(tmp, MANIFEST)
+            with open(manifest_path, 'w', encoding='utf-8') as writer:
+                json.dump(manifest, writer, sort_keys=True)
+
+            # Atomically publish the completed backup.
+
+            os.rename(tmp, path)
+            tmp = None
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    @classmethod
+    def restore(cls, path, directory, **kwargs):
+        """Restore cache from backup at `path` to new `directory`.
+
+        All references in the backup manifest are verified, including
+        SHA-256 checksums of the database and every external value file,
+        before anything is written to `directory`. If any referenced file
+        is missing or corrupt, the restore is refused with
+        :exc:`BackupError` and `directory` is left untouched.
+
+        An existing valid cache is never overwritten: if `directory`
+        exists and is not empty, :exc:`FileExistsError` is raised.
+
+        >>> cache = Cache.restore(
+        ...     '/tmp/example-backup', '/tmp/example-cache',
+        ... )  # doctest: +SKIP
+        >>> cache.close()  # doctest: +SKIP
+
+        :param str path: path of backup directory
+        :param str directory: path of new cache directory
+        :param kwargs: additional keyword arguments for `Cache`
+        :return: `Cache` instance opened at `directory`
+        :raises BackupError: if the backup is invalid or incomplete
+        :raises FileExistsError: if `directory` is not empty
+
+        """
+        _restore_backup(path, directory)
+        return cls(directory, **kwargs)
 
     def create_tag_index(self):
         """Create tag index on cache database.
