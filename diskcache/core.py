@@ -244,12 +244,19 @@ class Disk:
                     raise
                 continue
 
-            with writer:
-                size = 0
-                for chunk in iterator:
-                    size += len(chunk)
-                    writer.write(chunk)
-                return size
+            try:
+                with writer:
+                    size = 0
+                    for chunk in iterator:
+                        size += len(chunk)
+                        writer.write(chunk)
+                    return size
+            except BaseException:
+                # Remove the partially-written file so no orphan is left
+                # behind when the store operation fails.
+                with cl.suppress(OSError):
+                    os.remove(full_path)
+                raise
 
     def fetch(self, mode, filename, value, read):
         """Convert fields `mode`, `filename`, and `value` from Cache table to
@@ -441,6 +448,7 @@ class Cache:
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
         self._txn_id = None
+        self._txn_files = None
 
         if not op.isdir(directory):
             try:
@@ -708,19 +716,21 @@ class Cache:
     @cl.contextmanager
     def _transact(self, retry=False, filename=None):
         sql = self._sql
-        filenames = []
         _disk_remove = self._disk.remove
         tid = threading.get_ident()
         txn_id = self._txn_id
 
         if tid == txn_id:
             begin = False
+            txn_created, txn_deleted = self._txn_files
         else:
             while True:
                 try:
                     sql('BEGIN IMMEDIATE')
                     begin = True
                     self._txn_id = tid
+                    txn_created, txn_deleted = [], []
+                    self._txn_files = txn_created, txn_deleted
                     break
                 except sqlite3.OperationalError:
                     if retry:
@@ -729,22 +739,44 @@ class Cache:
                         _disk_remove(filename)
                     raise Timeout from None
 
+        # Files created by ``Disk.store`` before entering the transaction are
+        # registered with the outermost transaction. Should the outermost
+        # transaction roll back, those files are no longer referenced by the
+        # database and are removed.
+
+        if filename is not None:
+            txn_created.append(filename)
+
         try:
-            yield sql, filenames.append
+            yield sql, txn_deleted.append
         except BaseException:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
+                self._txn_files = None
                 sql('ROLLBACK')
+
+                # The database was restored to its pre-transaction state.
+                # Remove files created during the transaction which are no
+                # longer referenced. Files scheduled for deletion are kept
+                # since the database rows reference them again.
+
+                for name in txn_created:
+                    _disk_remove(name)
             raise
         else:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
+                self._txn_files = None
                 sql('COMMIT')
-            for name in filenames:
-                if name is not None:
-                    _disk_remove(name)
+
+                # The database changes are durable. Remove files that were
+                # replaced, deleted, or culled during the transaction.
+
+                for name in txn_deleted:
+                    if name is not None:
+                        _disk_remove(name)
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.

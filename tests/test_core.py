@@ -1,5 +1,6 @@
 """Test diskcache.core.Cache."""
 
+import contextlib as cl
 import errno
 import hashlib
 import io
@@ -1405,3 +1406,177 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+def _value_filenames(cache):
+    filenames = []
+    for dirpath, _, names in os.walk(cache.directory):
+        filenames += [name for name in names if name.endswith('.val')]
+    return filenames
+
+
+def test_transact_rollback_preserves_replaced_file():
+    with dc.Cache(disk_min_file_size=10) as cache:
+        old_value = b'0' * 100
+        new_value = b'1' * 100
+        cache.set('key', old_value)
+        assert len(_value_filenames(cache)) == 1
+
+        with pytest.raises(RuntimeError):
+            with cache.transact():
+                cache.set('key', new_value)
+                raise RuntimeError('boom')
+
+        # The rollback restored the old database row. The old value file
+        # must still exist and the new value file must be removed.
+        assert cache.get('key') == old_value
+        assert len(_value_filenames(cache)) == 1
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_transact_commit_removes_replaced_file():
+    with dc.Cache(disk_min_file_size=10) as cache:
+        cache.set('key', b'0' * 100)
+
+        with cache.transact():
+            cache.set('key', b'1' * 100)
+
+        assert cache.get('key') == b'1' * 100
+        assert len(_value_filenames(cache)) == 1
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_transact_nested_set_delete_rollback():
+    with dc.Cache(disk_min_file_size=10) as cache:
+        old_value = b'0' * 100
+        cache.set('key', old_value)
+
+        with pytest.raises(RuntimeError):
+            with cache.transact():
+                cache.set('key', b'1' * 100)
+                cache.delete('key')
+                cache.set('key', b'2' * 100)
+                with cache.transact():
+                    cache.set('key', b'3' * 100)
+                    cache.delete('key')
+                raise RuntimeError('boom')
+
+        assert cache.get('key') == old_value
+        assert len(_value_filenames(cache)) == 1
+
+        # Same sequence, but committed. Only the last value file remains.
+        with cache.transact():
+            cache.set('key', b'1' * 100)
+            cache.delete('key')
+            cache.set('key', b'2' * 100)
+            with cache.transact():
+                cache.set('key', b'3' * 100)
+
+        assert cache.get('key') == b'3' * 100
+        assert len(_value_filenames(cache)) == 1
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_transact_nested_exception_caught():
+    with dc.Cache(disk_min_file_size=10) as cache:
+        cache.set('key', b'0' * 100)
+
+        with cache.transact():
+            cache.set('key', b'1' * 100)
+            with cl.suppress(ValueError):
+                with cache.transact():
+                    cache.set('key', b'2' * 100)
+                    raise ValueError('boom')
+
+        # Nested transactions share the outermost transaction so the inner
+        # changes persist. Database and files must agree.
+        assert cache.get('key') == b'2' * 100
+        assert len(_value_filenames(cache)) == 1
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_transact_small_large_value_switching():
+    with dc.Cache(disk_min_file_size=10) as cache:
+        cache.set('key', 'small')
+        assert len(_value_filenames(cache)) == 0
+
+        with pytest.raises(RuntimeError):
+            with cache.transact():
+                cache.set('key', b'1' * 100)  # small to large
+                cache.set('key', 'tiny')  # large to small
+                cache.set('key', b'2' * 100)  # small to large
+                raise RuntimeError('boom')
+
+        assert cache.get('key') == 'small'
+        assert len(_value_filenames(cache)) == 0
+
+        with cache.transact():
+            cache.set('key', b'1' * 100)  # small to large
+            cache.set('key', 'tiny')  # large to small
+
+        assert cache.get('key') == 'tiny'
+        assert len(_value_filenames(cache)) == 0
+
+        with cache.transact():
+            cache.set('key', b'1' * 100)  # small to large
+
+        assert cache.get('key') == b'1' * 100
+        assert len(_value_filenames(cache)) == 1
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_transact_write_failure_leaves_no_file():
+    class BadReader:
+        def __init__(self):
+            self.count = 0
+
+        def read(self, size):
+            self.count += 1
+            if self.count > 2:
+                raise IOError('simulated disk failure')
+            return b'z' * size
+
+    with dc.Cache(disk_min_file_size=10) as cache:
+        with pytest.raises(IOError):
+            cache.set('key', BadReader(), read=True)
+
+        assert cache.get('key') is None
+        assert len(_value_filenames(cache)) == 0
+
+        # Failure inside an outer transaction that continues and commits.
+        with cache.transact():
+            cache.set('other', b'0' * 100)
+            with cl.suppress(IOError):
+                cache.set('key', BadReader(), read=True)
+
+        assert cache.get('key') is None
+        assert cache.get('other') == b'0' * 100
+        assert len(_value_filenames(cache)) == 1
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_transact_cull_rollback_restores_file():
+    with dc.Cache(disk_min_file_size=10, cull_limit=1) as cache:
+        cache.set('first', b'1' * 100)
+        cache.set('second', b'2' * 100)
+        # Allow the two current values but not a third.
+        cache.reset('size_limit', cache.volume() + 50)
+
+        with pytest.raises(RuntimeError):
+            with cache.transact():
+                cache.set('third', b'3' * 100)  # culls 'first'
+                assert cache.get('first') is None
+                raise RuntimeError('boom')
+
+        assert cache.get('first') == b'1' * 100
+        assert cache.get('second') == b'2' * 100
+        assert cache.get('third') is None
+        assert len(_value_filenames(cache)) == 2
+
+        with cache.transact():
+            cache.set('third', b'3' * 100)  # culls 'first'
+
+        assert cache.get('first') is None
+        assert cache.get('third') == b'3' * 100
+        assert len(_value_filenames(cache)) == 2
+    shutil.rmtree(cache.directory, ignore_errors=True)
