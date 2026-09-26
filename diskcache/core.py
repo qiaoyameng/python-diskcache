@@ -5,12 +5,14 @@ import codecs
 import contextlib as cl
 import errno
 import functools as ft
+import hashlib
 import io
 import json
 import os
 import os.path as op
 import pickle
 import pickletools
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -38,6 +40,10 @@ class Constant(tuple):
 DBNAME = 'cache.db'
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
+
+BACKUP_FORMAT = 'diskcache-backup'
+BACKUP_VERSION = 1
+BACKUP_MANIFEST = 'manifest.json'
 
 MODE_NONE = 0
 MODE_RAW = 1
@@ -412,6 +418,200 @@ def args_to_key(base, args, kwargs, typed, ignore):
             key += tuple(type(value) for _, value in sorted_items)
 
     return key
+
+
+def _sha256_file(path):
+    """Return the SHA-256 hex digest of the file at `path`."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as reader:
+        for chunk in iter(ft.partial(reader.read, 2**20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _staging_path(directory):
+    """Return a temporary sibling path used to stage `directory`."""
+    suffix = codecs.encode(os.urandom(4), 'hex').decode('utf-8')
+    return '%s.tmp-%d-%s' % (directory, os.getpid(), suffix)
+
+
+def _place_staging(staging, directory):
+    """Move `staging` into place at `directory`.
+
+    An existing empty directory is accepted as a target. Anything else
+    raises FileExistsError so existing data is never overwritten.
+
+    """
+    # POSIX rename silently replaces an existing empty directory, so
+    # remove an empty target and check again after the rename to avoid
+    # clobbering a concurrently created directory.
+    if op.lexists(directory):
+        if op.isdir(directory) and not op.islink(directory):
+            if not os.listdir(directory):
+                os.rmdir(directory)
+            else:
+                raise FileExistsError(
+                    errno.EEXIST, 'directory exists and is not empty', directory
+                )
+        else:
+            raise FileExistsError(
+                errno.EEXIST, 'directory exists', directory
+            )
+    try:
+        os.rename(staging, directory)
+    except OSError:
+        if op.lexists(directory):
+            raise FileExistsError(
+                errno.EEXIST, 'directory exists', directory
+            ) from None
+        raise
+
+
+def _write_manifest(directory, manifest):
+    """Write the backup `manifest` atomically within `directory`."""
+    temp_path = op.join(directory, BACKUP_MANIFEST + '.tmp')
+    with open(temp_path, 'w', encoding='utf-8') as writer:
+        json.dump(manifest, writer, sort_keys=True)
+        writer.flush()
+        os.fsync(writer.fileno())
+    os.rename(temp_path, op.join(directory, BACKUP_MANIFEST))
+
+
+def _read_manifest(directory, expect_format=BACKUP_FORMAT):
+    """Read and validate the backup manifest in `directory`."""
+    path = op.join(directory, BACKUP_MANIFEST)
+
+    if not op.isfile(path):
+        raise ValueError('no completed backup manifest: %s' % path)
+
+    try:
+        with open(path, encoding='utf-8') as reader:
+            manifest = json.load(reader)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            'malformed backup manifest: %s' % path
+        ) from error
+
+    if not isinstance(manifest, dict) or 'format' not in manifest:
+        raise ValueError('malformed backup manifest: %s' % path)
+
+    if manifest['format'] != expect_format:
+        raise ValueError('not a %s backup: %s' % (expect_format, directory))
+
+    if manifest.get('version') != BACKUP_VERSION:
+        raise ValueError(
+            'unsupported backup version: %r' % (manifest.get('version'),)
+        )
+
+    return manifest
+
+
+def _verify_backup(directory):
+    """Verify the completed backup in `directory` and return its manifest.
+
+    Validates the manifest format version, the size and SHA-256 checksum
+    of the database snapshot and every value file, and that every value
+    file referenced by the database snapshot is present in the backup.
+
+    """
+    manifest = _read_manifest(directory)
+
+    try:
+        entries = [manifest['db']] + list(manifest['files'])
+        paths = [entry['path'] for entry in entries]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            'malformed backup manifest: %s' % directory
+        ) from error
+
+    for entry in entries:
+        path = op.join(directory, entry['path'])
+        if not op.isfile(path):
+            raise FileNotFoundError(
+                errno.ENOENT, 'backup missing file', path
+            )
+        if op.getsize(path) != entry['size']:
+            raise ValueError('size mismatch in backup: %s' % path)
+        if _sha256_file(path) != entry['sha256']:
+            raise ValueError('checksum mismatch in backup: %s' % path)
+
+    # Verify every value file referenced by the database snapshot is
+    # included in the backup.
+    db_path = op.join(directory, DBNAME)
+    con = sqlite3.connect('file:%s?mode=ro' % db_path, uri=True)
+    try:
+        rows = con.execute(
+            'SELECT DISTINCT filename FROM Cache WHERE filename IS NOT NULL'
+        ).fetchall()
+    finally:
+        con.close()
+
+    referenced = {filename for (filename,) in rows}
+    missing = referenced - set(paths)
+
+    if missing:
+        raise ValueError(
+            'backup missing referenced value files: %s' % sorted(missing)
+        )
+
+    return manifest
+
+
+def _is_valid_cache(directory):
+    """Return True if `directory` contains a valid cache database."""
+    db_path = op.join(directory, DBNAME)
+
+    if not op.isfile(db_path):
+        return False
+
+    try:
+        con = sqlite3.connect('file:%s?mode=ro' % db_path, uri=True)
+        try:
+            con.execute('SELECT rowid FROM Cache LIMIT 1').fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+    return True
+
+
+def _check_restore_target(directory):
+    """Verify `directory` may be restored into without overwriting."""
+    if not op.lexists(directory):
+        return
+
+    if op.isdir(directory) and not os.listdir(directory):
+        return
+
+    if _is_valid_cache(directory):
+        raise ValueError(
+            'will not overwrite existing cache: %s' % directory
+        )
+
+    raise FileExistsError(
+        errno.EEXIST, 'directory exists and is not empty', directory
+    )
+
+
+def _copy_backup(backup_directory, directory, manifest):
+    """Copy a verified backup into `directory` via a staging directory."""
+    staging = _staging_path(directory)
+    os.makedirs(staging)
+
+    try:
+        for entry in [manifest['db']] + list(manifest['files']):
+            source = op.join(backup_directory, entry['path'])
+            target = op.join(staging, entry['path'])
+            target_dir, _ = op.split(target)
+            if target_dir:
+                with cl.suppress(OSError):
+                    os.makedirs(target_dir)
+            shutil.copyfile(source, target)
+        _place_staging(staging, directory)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 class Cache:
@@ -2336,6 +2536,186 @@ class Cache:
         ((page_count,),) = self._sql('PRAGMA page_count').fetchall()
         total_size = self._page_size * page_count + self.reset('size')
         return total_size
+
+    def backup(self, directory, retry=True):
+        """Create a consistent backup of the cache in `directory`.
+
+        The backup corresponds to a single logical moment: a consistent
+        snapshot of the SQLite database together with every value file
+        referenced by that snapshot.
+
+        Writes are blocked only briefly. While holding a short write
+        transaction, the database snapshot is taken with ``VACUUM INTO``
+        and every referenced value file is hard-linked into a staging
+        directory. Value files, which may be large, are then copied
+        without holding the write lock. Value files are immutable once
+        stored, so the links captured under the lock carry exactly the
+        bytes referenced at the snapshot moment even after concurrent
+        sets or deletes. If the cache filesystem does not support hard
+        links, the referenced files are copied while the short write
+        lock is held.
+
+        The backup is assembled in a temporary sibling directory and
+        atomically renamed into place, so temporary files are never
+        mistaken for a completed backup. A completion manifest,
+        ``manifest.json``, records the backup format version and the size
+        and SHA-256 checksum of the database snapshot and every
+        referenced value file.
+
+        Raises :exc:`Timeout` error when the write lock cannot be
+        acquired and `retry` is `False` (default True).
+
+        :param str directory: backup directory path (must not exist)
+        :param bool retry: retry if acquiring the write lock times out
+        :raises FileExistsError: if `directory` already exists
+        :raises Timeout: if the write lock cannot be acquired
+        :raises ValueError: if called from within a transaction
+
+        """
+        directory = str(directory)
+        directory = op.expanduser(directory)
+        directory = op.expandvars(directory)
+
+        if op.lexists(directory):
+            raise FileExistsError(
+                errno.EEXIST, 'backup directory exists', directory
+            )
+
+        if self._txn_id == threading.get_ident():
+            raise ValueError('cannot backup from within a transaction')
+
+        staging = _staging_path(directory)
+        links = op.join(
+            self._directory,
+            '.backup-links-%d-%s' % (
+                os.getpid(),
+                codecs.encode(os.urandom(4), 'hex').decode('utf-8'),
+            ),
+        )
+        os.makedirs(staging)
+        os.makedirs(links)
+
+        try:
+            snapshot = op.join(staging, DBNAME)
+
+            # The write lock blocks other writers only while the cheap
+            # metadata operations (snapshot and hard-links) complete.
+            with self._transact(retry=retry):
+                # A separate connection takes the snapshot. The write
+                # lock guarantees the snapshot reflects one complete
+                # logical moment and readers do not block the lock
+                # holder.
+                con = sqlite3.connect(
+                    op.join(self._directory, DBNAME),
+                    timeout=self._timeout,
+                    isolation_level=None,
+                )
+                try:
+                    con.execute('VACUUM INTO ?', (snapshot,))
+                    rows = con.execute(
+                        'SELECT DISTINCT filename FROM Cache'
+                        ' WHERE filename IS NOT NULL'
+                    ).fetchall()
+                finally:
+                    con.close()
+
+                # Pin every referenced value file. Files are deleted by
+                # other writers only after their transaction commits, so
+                # the links cannot be removed while the lock is held.
+                for (name,) in rows:
+                    source = op.join(self._directory, name)
+                    target = op.join(links, name)
+                    target_dir, _ = op.split(target)
+                    with cl.suppress(OSError):
+                        os.makedirs(target_dir)
+                    try:
+                        os.link(source, target)
+                    except OSError:
+                        # Fallback for filesystems without hard-link
+                        # support: copy under the short write lock.
+                        shutil.copyfile(source, target)
+
+            # Copy the pinned value files without the write lock.
+            for root, _, files in os.walk(links):
+                for filename in files:
+                    source = op.join(root, filename)
+                    name = op.relpath(source, links)
+                    target = op.join(staging, name)
+                    target_dir, _ = op.split(target)
+                    with cl.suppress(OSError):
+                        os.makedirs(target_dir)
+                    shutil.copyfile(source, target)
+
+            entries = []
+
+            for root, _, files in os.walk(staging):
+                for filename in files:
+                    if filename == DBNAME:
+                        continue
+                    path = op.join(root, filename)
+                    name = op.relpath(path, staging)
+                    entries.append(
+                        {
+                            'path': name,
+                            'size': op.getsize(path),
+                            'sha256': _sha256_file(path),
+                        }
+                    )
+
+            manifest = {
+                'format': BACKUP_FORMAT,
+                'version': BACKUP_VERSION,
+                'created': time.time(),
+                'db': {
+                    'path': DBNAME,
+                    'size': op.getsize(snapshot),
+                    'sha256': _sha256_file(snapshot),
+                },
+                'files': sorted(entries, key=lambda entry: entry['path']),
+            }
+            _write_manifest(staging, manifest)
+            _place_staging(staging, directory)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        finally:
+            shutil.rmtree(links, ignore_errors=True)
+
+    @classmethod
+    def restore(cls, backup_directory, directory, **kwargs):
+        """Restore a cache from a backup created by :meth:`backup`.
+
+        All references in the backup are validated before anything is
+        written: the manifest format version must be supported and every
+        referenced file must exist with a matching size and SHA-256
+        checksum. If any referenced file is missing or corrupt, the
+        restore is refused. An existing valid cache at `directory` is
+        never overwritten.
+
+        The restored cache is assembled in a temporary sibling directory
+        and atomically renamed into place.
+
+        :param str backup_directory: path to a completed backup
+        :param str directory: new cache directory path
+        :param kwargs: additional keyword arguments for `Cache`
+        :return: Cache instance opened on the restored directory
+        :raises ValueError: if the backup is invalid or `directory`
+            contains an existing valid cache
+        :raises FileNotFoundError: if a referenced backup file is missing
+        :raises FileExistsError: if `directory` exists and is not empty
+
+        """
+        backup_directory = str(backup_directory)
+        backup_directory = op.expanduser(backup_directory)
+        backup_directory = op.expandvars(backup_directory)
+        directory = str(directory)
+        directory = op.expanduser(directory)
+        directory = op.expandvars(directory)
+
+        _check_restore_target(directory)
+        manifest = _verify_backup(backup_directory)
+        _copy_backup(backup_directory, directory, manifest)
+        return cls(directory, **kwargs)
 
     def close(self):
         """Close database connection."""

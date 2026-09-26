@@ -1,16 +1,35 @@
 """Fanout cache automatically shards keys and values."""
 
 import contextlib as cl
+import errno
 import functools
 import itertools as it
 import operator
+import os
 import os.path as op
+import shutil
 import sqlite3
 import tempfile
 import time
 
-from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
+from .core import (
+    BACKUP_VERSION,
+    DEFAULT_SETTINGS,
+    ENOVAL,
+    Cache,
+    Disk,
+    Timeout,
+    _copy_backup,
+    _is_valid_cache,
+    _read_manifest,
+    _place_staging,
+    _staging_path,
+    _verify_backup,
+    _write_manifest,
+)
 from .persistent import Deque, Index
+
+FANOUT_BACKUP_FORMAT = 'diskcache-fanout-backup'
 
 
 class FanoutCache:
@@ -511,6 +530,141 @@ class FanoutCache:
 
         """
         return sum(shard.volume() for shard in self._shards)
+
+    def backup(self, directory, retry=True):
+        """Create a consistent backup of the cache in `directory`.
+
+        Each shard is backed up independently as its own consistent
+        snapshot, so the consistency boundary is a single shard: shards
+        may reflect slightly different logical moments. Within each
+        shard, the backup corresponds to a single logical moment and
+        includes every value file referenced at that moment.
+
+        The backup directory contains one subdirectory per shard
+        (``000``, ``001``, ...) plus a completion ``manifest.json``
+        recording the backup format version and shard count. The backup
+        is assembled in a temporary sibling directory and atomically
+        renamed into place, so temporary files are never mistaken for a
+        completed backup.
+
+        :param str directory: backup directory path (must not exist)
+        :param bool retry: retry if acquiring a shard write lock times
+            out (default True)
+        :raises FileExistsError: if `directory` already exists
+
+        """
+        directory = str(directory)
+        directory = op.expanduser(directory)
+        directory = op.expandvars(directory)
+
+        if op.lexists(directory):
+            raise FileExistsError(
+                errno.EEXIST, 'backup directory exists', directory
+            )
+
+        staging = _staging_path(directory)
+        os.makedirs(staging)
+
+        try:
+            for num, shard in enumerate(self._shards):
+                shard.backup(op.join(staging, '%03d' % num), retry=retry)
+            manifest = {
+                'format': FANOUT_BACKUP_FORMAT,
+                'version': BACKUP_VERSION,
+                'created': time.time(),
+                'shards': self._count,
+            }
+            _write_manifest(staging, manifest)
+            _place_staging(staging, directory)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    @classmethod
+    def restore(cls, backup_directory, directory, **kwargs):
+        """Restore a fanout cache from a backup created by :meth:`backup`.
+
+        Every shard backup is validated before anything is written: the
+        manifest format version must be supported and every referenced
+        file must exist with a matching size and SHA-256 checksum. If any
+        referenced file is missing or corrupt, the restore is refused. An
+        existing valid cache at `directory` is never overwritten.
+
+        The restored cache is assembled in a temporary sibling directory
+        and atomically renamed into place.
+
+        :param str backup_directory: path to a completed backup
+        :param str directory: new cache directory path
+        :param kwargs: additional keyword arguments for `FanoutCache`
+        :return: FanoutCache instance opened on the restored directory
+        :raises ValueError: if the backup is invalid or `directory`
+            contains an existing valid cache
+        :raises FileNotFoundError: if a referenced backup file is missing
+        :raises FileExistsError: if `directory` exists and is not empty
+
+        """
+        backup_directory = str(backup_directory)
+        backup_directory = op.expanduser(backup_directory)
+        backup_directory = op.expandvars(backup_directory)
+        directory = str(directory)
+        directory = op.expanduser(directory)
+        directory = op.expandvars(directory)
+
+        manifest = _read_manifest(
+            backup_directory, expect_format=FANOUT_BACKUP_FORMAT
+        )
+
+        try:
+            shards = int(manifest['shards'])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                'malformed backup manifest: %s' % backup_directory
+            ) from error
+
+        if shards < 1:
+            raise ValueError(
+                'malformed backup manifest: %s' % backup_directory
+            )
+
+        if op.lexists(directory):
+            if op.isdir(directory) and not os.listdir(directory):
+                pass
+            elif _is_valid_cache(directory) or any(
+                _is_valid_cache(op.join(directory, name))
+                for name in os.listdir(directory)
+            ):
+                raise ValueError(
+                    'will not overwrite existing cache: %s' % directory
+                )
+            else:
+                raise FileExistsError(
+                    errno.EEXIST,
+                    'directory exists and is not empty',
+                    directory,
+                )
+
+        # Validate all shard backups before copying anything.
+        shard_manifests = [
+            _verify_backup(op.join(backup_directory, '%03d' % num))
+            for num in range(shards)
+        ]
+
+        staging = _staging_path(directory)
+        os.makedirs(staging)
+
+        try:
+            for num, shard_manifest in enumerate(shard_manifests):
+                _copy_backup(
+                    op.join(backup_directory, '%03d' % num),
+                    op.join(staging, '%03d' % num),
+                    shard_manifest,
+                )
+            _place_staging(staging, directory)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        return cls(directory, shards=shards, **kwargs)
 
     def close(self):
         """Close database connection."""

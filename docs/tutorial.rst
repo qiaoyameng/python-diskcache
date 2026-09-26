@@ -663,6 +663,45 @@ transaction support may be requested.
 The cache shard exists in a subdirectory of the fanout-cache with the given
 name.
 
+.. _tutorial-backup:
+
+Backup and Restore
+------------------
+
+Naively copying ``cache.db`` and the ``.val`` files while the cache is in use
+can capture a broken combination: a database row may reference a value file
+that was already deleted by a concurrent ``set`` or ``delete``. Use
+:meth:`Cache.backup <diskcache.Cache.backup>` instead. The backup corresponds
+to one complete logical moment and contains the database snapshot plus every
+external value file referenced at that moment.
+
+To create a backup call ``cache.backup('/path/to/backup')``.
+
+Writers are blocked only briefly: while a short write transaction is held, the
+database is snapshotted with ``VACUUM INTO`` and the referenced value files are
+hard-linked into a staging directory. The potentially large value files are
+copied out of those links without holding the write lock.
+
+The backup is assembled in a temporary sibling directory and atomically
+renamed into place. Its ``manifest.json`` completion manifest records the
+format version and the size and SHA-256 checksum of the database snapshot and
+every value file. A temporary directory without that manifest is never treated
+as a completed backup.
+
+:meth:`Cache.restore <diskcache.Cache.restore>` validates the manifest and
+every reference (existence, size, and checksum) before writing anything. The
+restore is refused if a referenced file is missing or corrupt, and an
+existing valid cache is never overwritten.
+
+To restore, call ``Cache.restore('/path/to/backup', '/path/to/new-cache')``
+which returns a ``Cache`` opened on the restored directory.
+
+:meth:`FanoutCache.backup <diskcache.FanoutCache.backup>` and
+:meth:`FanoutCache.restore <diskcache.FanoutCache.restore>` work the same way.
+With a fanout cache the consistency boundary is a single shard: each shard is
+captured as its own independent consistent snapshot, so different shards may
+reflect slightly different moments.
+
 .. _tutorial-recipes:
 
 Recipes
