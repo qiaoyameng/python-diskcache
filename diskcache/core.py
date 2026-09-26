@@ -244,12 +244,23 @@ class Disk:
                     raise
                 continue
 
-            with writer:
-                size = 0
-                for chunk in iterator:
-                    size += len(chunk)
-                    writer.write(chunk)
-                return size
+            try:
+                with writer:
+                    size = 0
+                    for chunk in iterator:
+                        size += len(chunk)
+                        writer.write(chunk)
+                    return size
+            except BaseException:
+                # Remove the partially written file so that a failed
+                # write does not leave an unreferenced file behind.
+                with cl.suppress(OSError):
+                    os.remove(full_path)
+
+                with cl.suppress(OSError):
+                    os.removedirs(full_dir)
+
+                raise
 
     def fetch(self, mode, filename, value, read):
         """Convert fields `mode`, `filename`, and `value` from Cache table to
@@ -441,6 +452,7 @@ class Cache:
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
         self._txn_id = None
+        self._txn_filenames = None
 
         if not op.isdir(directory):
             try:
@@ -708,7 +720,6 @@ class Cache:
     @cl.contextmanager
     def _transact(self, retry=False, filename=None):
         sql = self._sql
-        filenames = []
         _disk_remove = self._disk.remove
         tid = threading.get_ident()
         txn_id = self._txn_id
@@ -729,22 +740,41 @@ class Cache:
                         _disk_remove(filename)
                     raise Timeout from None
 
+        if begin:
+            # The outermost transaction tracks value files until the
+            # transaction ends. Replaced or deleted files are removed only
+            # after COMMIT. Files created within the transaction are
+            # removed after ROLLBACK. Nested transactions share these lists
+            # so that file lifecycles follow the outermost transaction.
+            removals = []
+            creations = []
+            self._txn_filenames = removals, creations
+        else:
+            removals, creations = self._txn_filenames
+
+        if filename is not None:
+            creations.append(filename)
+
         try:
-            yield sql, filenames.append
+            yield sql, removals.append
         except BaseException:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
+                self._txn_filenames = None
                 sql('ROLLBACK')
+                for name in creations:
+                    _disk_remove(name)
             raise
         else:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
+                self._txn_filenames = None
                 sql('COMMIT')
-            for name in filenames:
-                if name is not None:
-                    _disk_remove(name)
+                for name in removals:
+                    if name is not None:
+                        _disk_remove(name)
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.

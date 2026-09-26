@@ -1,5 +1,6 @@
 """Test diskcache.core.Cache."""
 
+import contextlib as cl
 import errno
 import hashlib
 import io
@@ -294,6 +295,146 @@ def test_set_timeout(cache):
                 cache.set('a', 'b' * 2**20)
         finally:
             cache.check()
+
+
+def _value_files(cache):
+    names = []
+    for dirpath, _, filenames in os.walk(cache.directory):
+        for name in filenames:
+            if name.endswith('.val'):
+                names.append(op.join(dirpath, name))
+    return sorted(names)
+
+
+def test_transact_rollback_restores_large_value(cache):
+    cache.set('key', b'a' * 2**16)
+    (name,) = _value_files(cache)
+
+    with cl.suppress(ValueError):
+        with cache.transact():
+            cache.set('key', b'b' * 2**16)
+            raise ValueError
+
+    assert cache.get('key') == b'a' * 2**16
+    assert _value_files(cache) == [name]
+
+
+def test_transact_commit_removes_replaced_file(cache):
+    cache.set('key', b'a' * 2**16)
+    (old_name,) = _value_files(cache)
+
+    with cache.transact():
+        cache.set('key', b'b' * 2**16)
+
+    assert cache.get('key') == b'b' * 2**16
+    (new_name,) = _value_files(cache)
+    assert new_name != old_name
+    assert not op.exists(old_name)
+
+
+def test_transact_nested_set_delete_commit(cache):
+    cache.set('key', b'a' * 2**16)
+
+    with cache.transact():
+        cache.set('key', b'b' * 2**16)
+        cache.set('key', b'c' * 2**16)
+        cache.delete('key')
+        cache.set('key', b'd' * 2**16)
+        with cache.transact():
+            cache.set('key', b'e' * 2**16)
+            cache.delete('key')
+        cache.set('key', b'f' * 2**16)
+
+    assert cache.get('key') == b'f' * 2**16
+    assert len(_value_files(cache)) == 1
+
+
+def test_transact_nested_set_delete_rollback(cache):
+    cache.set('key', b'a' * 2**16)
+    (name,) = _value_files(cache)
+
+    with cl.suppress(ValueError):
+        with cache.transact():
+            cache.set('key', b'b' * 2**16)
+            cache.delete('key')
+            with cache.transact():
+                cache.set('key', b'c' * 2**16)
+            cache.delete('key')
+            raise ValueError
+
+    assert cache.get('key') == b'a' * 2**16
+    assert _value_files(cache) == [name]
+
+
+def test_transact_nested_exception_caught(cache):
+    cache.set('key', b'a' * 2**16)
+
+    with cache.transact():
+        cache.set('key', b'b' * 2**16)
+        with cl.suppress(ValueError):
+            with cache.transact():
+                cache.set('key', b'c' * 2**16)
+                raise ValueError
+
+    assert cache.get('key') == b'c' * 2**16
+    assert len(_value_files(cache)) == 1
+
+
+def test_transact_small_large_values(cache):
+    large_value = b'x' * 2**16
+
+    cache.set('key', 'small')
+    with cl.suppress(ValueError):
+        with cache.transact():
+            cache.set('key', large_value)
+            raise ValueError
+
+    assert cache.get('key') == 'small'
+    assert _value_files(cache) == []
+
+    cache.set('key', large_value)
+    (name,) = _value_files(cache)
+    with cl.suppress(ValueError):
+        with cache.transact():
+            cache.set('key', 'small')
+            raise ValueError
+
+    assert cache.get('key') == large_value
+    assert _value_files(cache) == [name]
+
+    with cache.transact():
+        cache.set('key', 'small')
+
+    assert cache.get('key') == 'small'
+    assert _value_files(cache) == []
+
+
+def test_transact_rollback_new_key_removes_file(cache):
+    with cl.suppress(ValueError):
+        with cache.transact():
+            cache.set('key', b'a' * 2**16)
+            raise ValueError
+
+    assert cache.get('key') is None
+    assert _value_files(cache) == []
+
+
+def test_set_read_error_removes_partial_file(cache):
+    class BadReader:
+        def __init__(self):
+            self.count = 0
+
+        def read(self, size):
+            self.count += 1
+            if self.count == 1:
+                return b'x' * 100
+            raise IOError('read failed')
+
+    with pytest.raises(IOError):
+        cache.set('key', BadReader(), read=True)
+
+    assert cache.get('key') is None
+    assert _value_files(cache) == []
 
 
 def test_raw(cache):
