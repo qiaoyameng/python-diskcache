@@ -521,8 +521,24 @@ class Cache:
             ' size INTEGER DEFAULT 0,'
             ' mode INTEGER DEFAULT 0,'
             ' filename TEXT,'
-            ' value BLOB)'
+            ' value BLOB,'
+            ' version INTEGER NOT NULL DEFAULT 0)'
         )
+
+        # Migrate caches created before the version column existed. Existing
+        # rows receive version 0 which can never be returned by
+        # ``_next_version`` and so can never match a version token.
+
+        cache_columns = {
+            column[1]
+            for column in sql('PRAGMA table_info(Cache)').fetchall()
+        }
+
+        if 'version' not in cache_columns:
+            sql(
+                'ALTER TABLE Cache ADD COLUMN'
+                ' version INTEGER NOT NULL DEFAULT 0'
+            )
 
         sql(
             'CREATE UNIQUE INDEX IF NOT EXISTS Cache_key_raw ON'
@@ -538,6 +554,15 @@ class Cache:
 
         if query is not None:
             sql(query)
+
+        # Monotonic counter backing never-reused change identities. It is
+        # only ever incremented inside write transactions.
+
+        sql(
+            'INSERT OR IGNORE INTO Settings (key, value) VALUES (?, ?)',
+            ('version', 0),
+        )
+        self.reset('version')
 
         # Use triggers to keep Metadata updated.
 
@@ -825,6 +850,7 @@ class Cache:
     def _row_update(self, rowid, now, columns):
         sql = self._sql
         expire_time, tag, size, mode, filename, value = columns
+        version = self._next_version(sql)
         sql(
             'UPDATE Cache SET'
             ' store_time = ?,'
@@ -835,7 +861,8 @@ class Cache:
             ' size = ?,'
             ' mode = ?,'
             ' filename = ?,'
-            ' value = ?'
+            ' value = ?,'
+            ' version = ?'
             ' WHERE rowid = ?',
             (
                 now,  # store_time
@@ -847,18 +874,21 @@ class Cache:
                 mode,
                 filename,
                 value,
+                version,
                 rowid,
             ),
         )
+        return version
 
     def _row_insert(self, key, raw, now, columns):
         sql = self._sql
         expire_time, tag, size, mode, filename, value = columns
+        version = self._next_version(sql)
         sql(
             'INSERT INTO Cache('
             ' key, raw, store_time, expire_time, access_time,'
-            ' access_count, tag, size, mode, filename, value'
-            ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' access_count, tag, size, mode, filename, value, version'
+            ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 key,
                 raw,
@@ -871,8 +901,37 @@ class Cache:
                 mode,
                 filename,
                 value,
+                version,
             ),
         )
+        return version
+
+    def _next_version(self, sql=None):
+        """Allocate a fresh change identity.
+
+        Versions are drawn from a monotonically increasing counter shared by
+        every process that opens the cache directory. A version is never
+        issued twice: deletion, expiration, and value churn all consume new
+        numbers rather than reusing old ones. The counter update must run
+        inside the same write transaction as the row change so that a
+        rollback also rolls the counter back.
+
+        :param sql: execute callable of an open transaction (default None)
+        :return: positive integer version token
+
+        """
+        if sql is None:
+            sql = self._sql
+
+        rows = sql(
+            'UPDATE Settings SET value = value + 1'
+            ' WHERE key = "version"'
+        )
+        assert rows.rowcount == 1
+        ((version,),) = sql(
+            'SELECT value FROM Settings WHERE key = "version"'
+        ).fetchall()
+        return version
 
     def _cull(self, now, sql, cleanup, limit=None):
         cull_limit = self.cull_limit if limit is None else limit
@@ -953,9 +1012,11 @@ class Cache:
                 ((rowid, old_expire_time),) = rows
 
                 if old_expire_time is None or old_expire_time > now:
+                    new_version = self._next_version(sql)
                     sql(
-                        'UPDATE Cache SET expire_time = ? WHERE rowid = ?',
-                        (expire_time, rowid),
+                        'UPDATE Cache SET expire_time = ?, version = ?'
+                        ' WHERE rowid = ?',
+                        (expire_time, new_version, rowid),
                     )
                     return True
 
@@ -1079,14 +1140,17 @@ class Cache:
 
             value += delta
 
-            columns = 'store_time = ?, value = ?'
+            new_version = self._next_version(sql)
+            columns = 'store_time = ?, value = ?, version = ?'
             update_column = EVICTION_POLICY[self.eviction_policy]['get']
 
             if update_column is not None:
                 columns += ', ' + update_column.format(now=now)
 
             update = 'UPDATE Cache SET %s WHERE rowid = ?' % columns
-            sql(update, (now, value, rowid))
+            params = [now, value, new_version]
+            params.append(rowid)
+            sql(update, params)
 
             return value
 
@@ -1128,6 +1192,7 @@ class Cache:
         expire_time=False,
         tag=False,
         retry=False,
+        version=False,
     ):
         """Retrieve value from cache. If `key` is missing, return `default`.
 
@@ -1142,6 +1207,7 @@ class Cache:
             (default False)
         :param bool tag: if True, return tag in tuple (default False)
         :param bool retry: retry if database timeout occurs (default False)
+        :param bool version: if True, return version in tuple (default False)
         :return: value for item or default if key not found
         :raises Timeout: if database timeout occurs
 
@@ -1149,15 +1215,15 @@ class Cache:
         db_key, raw = self._disk.put(key)
         update_column = EVICTION_POLICY[self.eviction_policy]['get']
         select = (
-            'SELECT rowid, expire_time, tag, mode, filename, value'
+            'SELECT rowid, expire_time, tag, mode, filename, value, version'
             ' FROM Cache WHERE key = ? AND raw = ?'
             ' AND (expire_time IS NULL OR expire_time > ?)'
         )
 
-        if expire_time and tag:
-            default = (default, None, None)
-        elif expire_time or tag:
-            default = (default, None)
+        extra_count = int(bool(expire_time)) + int(bool(tag)) + int(bool(version))
+
+        if extra_count:
+            default = (default,) + (None,) * extra_count
 
         if not self.statistics and update_column is None:
             # Fast path, no transaction necessary.
@@ -1167,7 +1233,17 @@ class Cache:
             if not rows:
                 return default
 
-            ((rowid, db_expire_time, db_tag, mode, filename, db_value),) = rows
+            (
+                (
+                    rowid,
+                    db_expire_time,
+                    db_tag,
+                    mode,
+                    filename,
+                    db_value,
+                    db_version,
+                ),
+            ) = rows
 
             try:
                 value = self._disk.fetch(mode, filename, db_value, read)
@@ -1192,7 +1268,15 @@ class Cache:
                     return default
 
                 (
-                    (rowid, db_expire_time, db_tag, mode, filename, db_value),
+                    (
+                        rowid,
+                        db_expire_time,
+                        db_tag,
+                        mode,
+                        filename,
+                        db_value,
+                        db_version,
+                    ),
                 ) = rows  # noqa: E127
 
                 try:
@@ -1212,14 +1296,16 @@ class Cache:
                 if update_column is not None:
                     sql(update % update_column.format(now=now), (rowid,))
 
-        if expire_time and tag:
-            return (value, db_expire_time, db_tag)
-        elif expire_time:
-            return (value, db_expire_time)
-        elif tag:
-            return (value, db_tag)
-        else:
-            return value
+        result = (value,)
+
+        if expire_time:
+            result += (db_expire_time,)
+        if tag:
+            result += (db_tag,)
+        if version:
+            result += (db_version,)
+
+        return result[0] if len(result) == 1 else result
 
     def __getitem__(self, key):
         """Return corresponding value for `key` from cache.
@@ -1383,6 +1469,171 @@ class Cache:
             return self.__delitem__(key, retry=retry)
         except KeyError:
             return False
+
+    def cas(
+        self,
+        key,
+        value,
+        version,
+        expire=ENOVAL,
+        read=False,
+        tag=ENOVAL,
+        retry=False,
+    ):
+        """Compare-and-set `key` to `value` if `version` is current.
+
+        The value, tag, and expiry are only updated when the `version`
+        returned by :meth:`get` with ``version=True`` still identifies the
+        live row. Versions are change identities, not content hashes: every
+        successful write draws a fresh, never-reused version, so deletion
+        followed by recreation, expiration followed by recreation, and
+        changing a value back to an earlier value all invalidate old
+        versions.
+
+        The expiry check and the version comparison run against the same
+        snapshot inside a single write transaction, so an item that has
+        expired (or been removed and replaced) cannot be updated using a
+        stale token.
+
+        By default the existing `expire` time and `tag` are preserved. Pass
+        ``expire=None`` or ``tag=None`` explicitly to clear them. On a
+        failed comparison nothing changes: not the value, not the tag, and
+        not the expiry.
+
+        When `read` is `True`, `value` should be a file-like object opened
+        for reading in binary mode.
+
+        :param key: key for item
+        :param value: value for item
+        :param int version: expected version token from `get(version=True)`
+        :param float expire: seconds until item expires
+            (default ENOVAL, preserve current expiry)
+        :param bool read: read value as bytes from file (default False)
+        :param tag: text to associate with key
+            (default ENOVAL, preserve current tag)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item was set, False on version conflict
+        :raises Timeout: if database timeout occurs
+
+        """
+        now = time.time()
+        db_key, raw = self._disk.put(key)
+        size, mode, filename, db_value = self._disk.store(
+            value, read, key=key
+        )
+        select = (
+            'SELECT rowid, expire_time, tag, filename, version FROM Cache'
+            ' WHERE key = ? AND raw = ?'
+            ' AND (expire_time IS NULL OR expire_time > ?)'
+        )
+
+        try:
+            with self._transact(retry, filename) as (sql, cleanup):
+                rows = sql(select, (db_key, raw, now)).fetchall()
+
+                if not rows:
+                    # Missing or expired: the token cannot identify a live
+                    # row in this transaction view.
+                    cleanup(filename)
+                    return False
+
+                (
+                    (rowid, old_expire_time, old_tag, old_filename, current),
+                ) = rows
+
+                if version < 1 or current != version:
+                    # Someone else changed the item. Leave their row and
+                    # file alone; discard the candidate value instead.
+                    cleanup(filename)
+                    return False
+
+                if expire is ENOVAL:
+                    new_expire = old_expire_time
+                elif expire is None:
+                    new_expire = None
+                else:
+                    new_expire = now + expire
+                new_tag = old_tag if tag is ENOVAL else tag
+
+                new_version = self._next_version(sql)
+
+                sql(
+                    'UPDATE Cache SET'
+                    ' store_time = ?,'
+                    ' expire_time = ?,'
+                    ' access_time = ?,'
+                    ' access_count = ?,'
+                    ' tag = ?,'
+                    ' size = ?,'
+                    ' mode = ?,'
+                    ' filename = ?,'
+                    ' value = ?,'
+                    ' version = ?'
+                    ' WHERE rowid = ?',
+                    (
+                        now,
+                        new_expire,
+                        now,
+                        0,
+                        new_tag,
+                        size,
+                        mode,
+                        filename,
+                        db_value,
+                        new_version,
+                        rowid,
+                    ),
+                )
+
+                cleanup(old_filename)
+                self._cull(now, sql, cleanup)
+
+                return True
+        except BaseException:
+            # On rollback the database still references whatever file it did
+            # before; the candidate file would otherwise be orphaned.
+            if filename is not None:
+                self._disk.remove(filename)
+            raise
+
+    def cad(self, key, version, retry=False):
+        """Compare-and-delete `key` if `version` is current.
+
+        The expiry check and the version comparison run against the same
+        snapshot inside a single write transaction. Deleting and recreating
+        the key (or letting it expire and recreating it) invalidates the
+        token, so a stale `version` never removes the new item.
+
+        :param key: key for item
+        :param int version: expected version token from `get(version=True)`
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item was deleted, False on version conflict
+        :raises Timeout: if database timeout occurs
+
+        """
+        now = time.time()
+        db_key, raw = self._disk.put(key)
+
+        with self._transact(retry) as (sql, cleanup):
+            rows = sql(
+                'SELECT rowid, filename, version FROM Cache'
+                ' WHERE key = ? AND raw = ?'
+                ' AND (expire_time IS NULL OR expire_time > ?)',
+                (db_key, raw, now),
+            ).fetchall()
+
+            if not rows:
+                return False
+
+            ((rowid, filename, current),) = rows
+
+            if version < 1 or current != version:
+                return False
+
+            sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+            cleanup(filename)
+
+            return True
 
     def push(
         self,
