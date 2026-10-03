@@ -261,6 +261,7 @@ class FanoutCache:
         read=False,
         expire_time=False,
         tag=False,
+        version=False,
         retry=False,
     ):
         """Retrieve value from cache. If `key` is missing, return `default`.
@@ -275,6 +276,7 @@ class FanoutCache:
         :param float expire_time: if True, return expire_time in tuple
             (default False)
         :param tag: if True, return tag in tuple (default False)
+        :param bool version: if True, return version in tuple (default False)
         :param bool retry: retry if database timeout occurs (default False)
         :return: value for item if key is found else default
 
@@ -282,7 +284,15 @@ class FanoutCache:
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.get(key, default, read, expire_time, tag, retry)
+            return shard.get(
+                key,
+                default,
+                read,
+                expire_time,
+                tag,
+                version,
+                retry,
+            )
         except (Timeout, sqlite3.OperationalError):
             return default
 
@@ -351,6 +361,51 @@ class FanoutCache:
             return shard.pop(key, default, expire_time, tag, retry)
         except Timeout:
             return default
+
+    def cas(
+        self, key, value, version, expire=ENOVAL, read=False, tag=ENOVAL,
+        retry=False,
+    ):
+        """Compare-and-set `key` to `value` conditioned on `version`.
+
+        Delegates to the shard holding `key`. See :meth:`Cache.cas`.
+
+        :param key: key for item
+        :param value: new value for item
+        :param version: expected version from `get(version=True)`
+        :param float expire: seconds until item expires (default ENOVAL, keep)
+        :param bool read: read value as bytes from file (default False)
+        :param tag: text to associate with key (default ENOVAL, keep current)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item was updated, False on version conflict
+
+        """
+        index = self._hash(key) % self._count
+        shard = self._shards[index]
+        try:
+            return shard.cas(
+                key, value, version, expire, read, tag, retry
+            )
+        except Timeout:
+            return False
+
+    def cad(self, key, version, retry=False):
+        """Compare-and-delete item for `key` conditioned on `version`.
+
+        Delegates to the shard holding `key`. See :meth:`Cache.cad`.
+
+        :param key: key for item
+        :param version: expected version from `get(version=True)`
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item was deleted, False on version conflict
+
+        """
+        index = self._hash(key) % self._count
+        shard = self._shards[index]
+        try:
+            return shard.cad(key, version, retry)
+        except Timeout:
+            return False
 
     def delete(self, key, retry=False):
         """Delete corresponding item for `key` from cache.
