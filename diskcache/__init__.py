@@ -28,6 +28,7 @@ from .recipes import (
     memoize_stampede,
     throttle,
 )
+from .taskbox import TaskBox
 
 __all__ = [
     'Averager',
@@ -44,6 +45,7 @@ __all__ = [
     'JSONDisk',
     'Lock',
     'RLock',
+    'TaskBox',
     'Timeout',
     'UNKNOWN',
     'UnknownFileWarning',

@@ -5,6 +5,7 @@ import diskcache.djangocache
 import diskcache.fanout
 import diskcache.persistent
 import diskcache.recipes
+import diskcache.taskbox
 
 
 def test_core():
@@ -29,6 +30,11 @@ def test_persistent():
 
 def test_recipes():
     failures, _ = doctest.testmod(diskcache.recipes)
+    assert failures == 0
+
+
+def test_taskbox():
+    failures, _ = doctest.testmod(diskcache.taskbox)
     assert failures == 0
 
 
