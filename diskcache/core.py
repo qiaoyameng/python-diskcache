@@ -39,6 +39,22 @@ DBNAME = 'cache.db'
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
 
+
+def system_clock():
+    """Return current wall-clock time as POSIX epoch seconds.
+
+    All expiry times (legacy fixed expiry, idle deadlines, and hard
+    deadlines) are persisted as plain epoch seconds so any process or
+    machine reading the database interprets them the same way.
+
+    The function is module-level rather than aliasing ``time.time`` so
+    that test suites which patch ``diskcache.core.time.time`` continue to
+    steer caches constructed without an explicit clock.
+
+    """
+    return time.time()
+
+
 MODE_NONE = 0
 MODE_RAW = 1
 MODE_BINARY = 2
@@ -58,6 +74,11 @@ DEFAULT_SETTINGS = {
     'sqlite_synchronous': 1,  # NORMAL
     'disk_min_file_size': 2**15,  # 32kb
     'disk_pickle_protocol': pickle.HIGHEST_PROTOCOL,
+    # Upper bound on how long an idle-deadline refresh may be deferred, as a
+    # fraction of the item's idle TTL. With 0.1, a constantly-read item only
+    # writes its refreshed idle deadline once per 10% of its idle TTL, and an
+    # item may expire at most 10% early when its process stops reading.
+    'idle_renew_threshold': 0.1,
 }
 
 METADATA = {
@@ -417,12 +438,22 @@ def args_to_key(base, args, kwargs, typed, ignore):
 class Cache:
     """Disk and file backed cache."""
 
-    def __init__(self, directory=None, timeout=60, disk=Disk, **settings):
+    def __init__(
+        self,
+        directory=None,
+        timeout=60,
+        disk=Disk,
+        clock=system_clock,
+        **settings
+    ):
         """Initialize cache instance.
 
         :param str directory: cache directory
         :param float timeout: SQLite connection timeout
         :param disk: Disk type or subclass for serialization
+        :param callable clock: zero-argument callable returning the current
+            time as POSIX epoch seconds (default :func:`system_clock`);
+            inject a fake clock for deterministic testing
         :param settings: any of DEFAULT_SETTINGS
 
         """
@@ -430,6 +461,9 @@ class Cache:
             assert issubclass(disk, Disk)
         except (TypeError, AssertionError):
             raise ValueError('disk must subclass diskcache.Disk') from None
+
+        if not callable(clock):
+            raise ValueError('clock must be a zero-argument callable')
 
         if directory is None:
             directory = tempfile.mkdtemp(prefix='diskcache-')
@@ -439,6 +473,7 @@ class Cache:
 
         self._directory = directory
         self._timeout = 0  # Manually handle retries during initialization.
+        self._clock = clock
         self._local = threading.local()
         self._txn_id = None
 
@@ -524,6 +559,30 @@ class Cache:
             ' value BLOB)'
         )
 
+        # Idle TTL / hard deadline policy columns (migrated databases).
+        #
+        # idle_ttl: idle time-to-live in seconds. A read hit refreshes the
+        #     idle deadline to "now + idle_ttl".
+        # idle_expire_time: current idle deadline as POSIX epoch seconds.
+        # hard_expire_time: absolute hard deadline as POSIX epoch seconds.
+        #     Never extended by reads or clock rollback.
+        #
+        # All three are NULL for rows written by older releases and for
+        # fixed-`expire` items: such rows keep their historical semantics.
+
+        columns = {
+            row[1] for row in sql('PRAGMA table_info(Cache)').fetchall()
+        }
+
+        if 'idle_ttl' not in columns:
+            sql('ALTER TABLE Cache ADD COLUMN idle_ttl REAL')
+
+        if 'idle_expire_time' not in columns:
+            sql('ALTER TABLE Cache ADD COLUMN idle_expire_time REAL')
+
+        if 'hard_expire_time' not in columns:
+            sql('ALTER TABLE Cache ADD COLUMN hard_expire_time REAL')
+
         sql(
             'CREATE UNIQUE INDEX IF NOT EXISTS Cache_key_raw ON'
             ' Cache(key, raw)'
@@ -604,6 +663,45 @@ class Cache:
     def disk(self):
         """Disk used for serialization."""
         return self._disk
+
+    def _now(self):
+        """Current time from the injected clock (POSIX epoch seconds)."""
+        return self._clock()
+
+    @staticmethod
+    def _policy_expire_time(now, expire, idle, hard):
+        """Build expiry columns for set/add/touch/push.
+
+        Returns ``(expire_time, idle_ttl, idle_expire_time,
+        hard_expire_time)``. The fixed `expire` argument keeps legacy
+        semantics and must not be combined with the optional `idle` /
+        `hard` policy. The effective ``expire_time`` is always the
+        earliest of the idle deadline and the hard deadline.
+
+        """
+        if expire is not None and (idle is not None or hard is not None):
+            raise ValueError(
+                "'expire' cannot be combined with 'idle' or 'hard'"
+            )
+
+        if expire is not None:
+            return now + expire, None, None, None
+
+        if idle is None and hard is None:
+            return None, None, None, None
+
+        idle_ttl = float(idle) if idle is not None else None
+        idle_expire_time = now + idle if idle is not None else None
+        hard_expire_time = now + hard if hard is not None else None
+
+        deadlines = [
+            deadline
+            for deadline in (idle_expire_time, hard_expire_time)
+            if deadline is not None
+        ]
+        expire_time = min(deadlines)
+
+        return expire_time, idle_ttl, idle_expire_time, hard_expire_time
 
     @property
     def _con(self):
@@ -746,11 +844,32 @@ class Cache:
                 if name is not None:
                     _disk_remove(name)
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        idle=None,
+        hard=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        Optional expiry policy:
+
+        * `expire` gives the legacy fixed time-to-live in seconds.
+        * `idle` gives an idle time-to-live in seconds. Each successful read
+          refreshes the item's idle deadline to "read time + idle".
+        * `hard` gives a maximum lifetime in seconds. The hard deadline is
+          absolute, stored at set time, and never extended by reads.
+
+        `expire` cannot be combined with `idle` or `hard`. When both `idle`
+        and `hard` are given, the item expires at the earlier deadline.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -762,15 +881,19 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds; read hits refresh
+            the deadline (default None, no idle expiry)
+        :param float hard: maximum lifetime in seconds from set time; the
+            hard deadline is never extended (default None, no hard deadline)
         :return: True if item was set
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
-        expire_time = None if expire is None else now + expire
+        policy = self._policy_expire_time(now, expire, idle, hard)
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
-        columns = (expire_time, tag, size, mode, filename, db_value)
+        columns = policy + (tag, size, mode, filename, db_value)
 
         # The order of SELECT, UPDATE, and INSERT is important below.
         #
@@ -824,11 +947,24 @@ class Cache:
 
     def _row_update(self, rowid, now, columns):
         sql = self._sql
-        expire_time, tag, size, mode, filename, value = columns
+        (
+            expire_time,
+            idle_ttl,
+            idle_expire_time,
+            hard_expire_time,
+            tag,
+            size,
+            mode,
+            filename,
+            value,
+        ) = columns
         sql(
             'UPDATE Cache SET'
             ' store_time = ?,'
             ' expire_time = ?,'
+            ' idle_ttl = ?,'
+            ' idle_expire_time = ?,'
+            ' hard_expire_time = ?,'
             ' access_time = ?,'
             ' access_count = ?,'
             ' tag = ?,'
@@ -840,6 +976,9 @@ class Cache:
             (
                 now,  # store_time
                 expire_time,
+                idle_ttl,
+                idle_expire_time,
+                hard_expire_time,
                 now,  # access_time
                 0,  # access_count
                 tag,
@@ -853,12 +992,23 @@ class Cache:
 
     def _row_insert(self, key, raw, now, columns):
         sql = self._sql
-        expire_time, tag, size, mode, filename, value = columns
+        (
+            expire_time,
+            idle_ttl,
+            idle_expire_time,
+            hard_expire_time,
+            tag,
+            size,
+            mode,
+            filename,
+            value,
+        ) = columns
         sql(
             'INSERT INTO Cache('
             ' key, raw, store_time, expire_time, access_time,'
-            ' access_count, tag, size, mode, filename, value'
-            ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' access_count, tag, size, mode, filename, value,'
+            ' idle_ttl, idle_expire_time, hard_expire_time'
+            ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 key,
                 raw,
@@ -871,6 +1021,9 @@ class Cache:
                 mode,
                 filename,
                 value,
+                idle_ttl,
+                idle_expire_time,
+                hard_expire_time,
             ),
         )
 
@@ -924,8 +1077,112 @@ class Cache:
             for (filename,) in rows:
                 cleanup(filename)
 
-    def touch(self, key, expire=None, retry=False):
-        """Touch `key` in cache and update `expire` time.
+    def _idle_refresh_due(self, idle_ttl, old_idle_expire, now):
+        """Return ideal idle deadline if a persisted refresh is due.
+
+        Return None when the row has no idle TTL or its persisted idle
+        deadline is still within the throttling slack. The slack is
+        ``idle_renew_threshold * idle_ttl`` bounding both the write rate
+        of hot keys and how early (at most the slack) an item can expire
+        after reads stop.
+
+        """
+        if idle_ttl is None:
+            return None
+
+        ideal_idle_expire = now + idle_ttl
+
+        if old_idle_expire is not None:
+            slack = self.idle_renew_threshold * idle_ttl
+
+            if ideal_idle_expire - old_idle_expire <= slack:
+                return None
+
+        return ideal_idle_expire
+
+    def _renew_idle(self, sql, row, now):
+        """Conditionally refresh the idle deadline of a row read at `now`.
+
+        `row` is the tuple
+        ``(rowid, idle_ttl, idle_expire_time, hard_expire_time,
+           expire_time, store_time)`` fetched during the read.
+
+        The refresh is throttled (see `_idle_refresh_due`). The write is
+        conditional on the row still carrying exactly the deadlines read:
+        same store time, effective expiry, hard deadline, idle TTL, and
+        previously stored idle deadline. A concurrent `set` or `touch` can
+        therefore never have its new deadlines overwritten by a stale
+        renewal.
+
+        The hard deadline column is never modified, so moving the clock
+        backwards cannot extend it. Both the idle and effective deadlines
+        are recomputed from the current clock and may move backwards.
+
+        """
+        (
+            rowid,
+            idle_ttl,
+            old_idle_expire,
+            hard_expire,
+            old_expire,
+            store_time,
+        ) = row
+
+        ideal_idle_expire = self._idle_refresh_due(
+            idle_ttl, old_idle_expire, now
+        )
+
+        if ideal_idle_expire is None:
+            return
+
+        deadlines = [
+            deadline
+            for deadline in (ideal_idle_expire, hard_expire)
+            if deadline is not None
+        ]
+        new_expire_time = min(deadlines)
+
+        update = (
+            'UPDATE Cache SET idle_expire_time = ?, expire_time = ?'
+            ' WHERE rowid = ?'
+            ' AND store_time IS ?'
+            ' AND expire_time IS ?'
+            ' AND idle_ttl IS ?'
+            ' AND idle_expire_time IS ?'
+            ' AND hard_expire_time IS ?'
+        )
+        sql(
+            update,
+            (
+                ideal_idle_expire,
+                new_expire_time,
+                rowid,
+                store_time,
+                old_expire,
+                idle_ttl,
+                old_idle_expire,
+                hard_expire,
+            ),
+        )
+
+    def touch(
+        self,
+        key,
+        expire=None,
+        retry=False,
+        idle=None,
+        hard=None,
+    ):
+        """Touch `key` in cache and update its expiry policy.
+
+        With no expiry argument all deadlines are cleared and the item no
+        longer expires (legacy behavior). `expire` sets a fixed
+        time-to-live. `idle` and `hard` set a fresh idle deadline and hard
+        deadline measured from the touch time; `expire` cannot be combined
+        with `idle` or `hard`.
+
+        Only live items are touched. Missing or expired items return
+        `False` and are left untouched.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -934,13 +1191,16 @@ class Cache:
         :param float expire: seconds until item expires
             (default None, no expiry)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds (default None)
+        :param float hard: maximum lifetime in seconds from touch time
+            (default None)
         :return: True if key was touched
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
-        expire_time = None if expire is None else now + expire
+        policy = self._policy_expire_time(now, expire, idle, hard)
 
         with self._transact(retry) as (sql, _):
             rows = sql(
@@ -954,14 +1214,29 @@ class Cache:
 
                 if old_expire_time is None or old_expire_time > now:
                     sql(
-                        'UPDATE Cache SET expire_time = ? WHERE rowid = ?',
-                        (expire_time, rowid),
+                        'UPDATE Cache SET'
+                        ' expire_time = ?,'
+                        ' idle_ttl = ?,'
+                        ' idle_expire_time = ?,'
+                        ' hard_expire_time = ?'
+                        ' WHERE rowid = ?',
+                        policy + (rowid,),
                     )
                     return True
 
         return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        idle=None,
+        hard=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -971,6 +1246,9 @@ class Cache:
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        See `set` for the `expire`, `idle`, and `hard` expiry policy
+        arguments.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -982,15 +1260,17 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds (default None)
+        :param float hard: maximum lifetime in seconds (default None)
         :return: True if item was added
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
-        expire_time = None if expire is None else now + expire
+        policy = self._policy_expire_time(now, expire, idle, hard)
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
-        columns = (expire_time, tag, size, mode, filename, db_value)
+        columns = policy + (tag, size, mode, filename, db_value)
 
         with self._transact(retry, filename) as (sql, cleanup):
             rows = sql(
@@ -1040,7 +1320,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
         select = (
             'SELECT rowid, expire_time, filename, value FROM Cache'
@@ -1055,7 +1335,7 @@ class Cache:
                     raise KeyError(key)
 
                 value = default + delta
-                columns = (None, None) + self._disk.store(
+                columns = (None,) * 5 + self._disk.store(
                     value, False, key=key
                 )
                 self._row_insert(db_key, raw, now, columns)
@@ -1069,7 +1349,7 @@ class Cache:
                     raise KeyError(key)
 
                 value = default + delta
-                columns = (None, None) + self._disk.store(
+                columns = (None,) * 5 + self._disk.store(
                     value, False, key=key
                 )
                 self._row_update(rowid, now, columns)
@@ -1149,7 +1429,8 @@ class Cache:
         db_key, raw = self._disk.put(key)
         update_column = EVICTION_POLICY[self.eviction_policy]['get']
         select = (
-            'SELECT rowid, expire_time, tag, mode, filename, value'
+            'SELECT rowid, expire_time, tag, mode, filename, value,'
+            ' idle_ttl, idle_expire_time, hard_expire_time, store_time'
             ' FROM Cache WHERE key = ? AND raw = ?'
             ' AND (expire_time IS NULL OR expire_time > ?)'
         )
@@ -1162,18 +1443,55 @@ class Cache:
         if not self.statistics and update_column is None:
             # Fast path, no transaction necessary.
 
-            rows = self._sql(select, (db_key, raw, time.time())).fetchall()
+            now = self._now()
+            rows = self._sql(select, (db_key, raw, now)).fetchall()
 
             if not rows:
                 return default
 
-            ((rowid, db_expire_time, db_tag, mode, filename, db_value),) = rows
+            (
+                (
+                    rowid,
+                    db_expire_time,
+                    db_tag,
+                    mode,
+                    filename,
+                    db_value,
+                    idle_ttl,
+                    idle_expire_time,
+                    hard_expire_time,
+                    store_time,
+                ),
+            ) = rows
 
             try:
                 value = self._disk.fetch(mode, filename, db_value, read)
             except IOError:
                 # Key was deleted before we could retrieve result.
                 return default
+
+            # Successful read: refresh the idle deadline (throttled and
+            # guarded so a concurrent set can never be overwritten). The
+            # throttle check happens before taking any write lock so that
+            # very hot keys normally avoid any database write.
+
+            renew_now = self._now()
+            ideal_idle_expire = self._idle_refresh_due(
+                idle_ttl, idle_expire_time, renew_now
+            )
+
+            if ideal_idle_expire is not None:
+                renew_row = (
+                    rowid,
+                    idle_ttl,
+                    idle_expire_time,
+                    hard_expire_time,
+                    db_expire_time,
+                    store_time,
+                )
+
+                with self._transact(retry) as (sql, _):
+                    self._renew_idle(sql, renew_row, renew_now)
 
         else:  # Slow path, transaction required.
             cache_hit = (
@@ -1184,7 +1502,8 @@ class Cache:
             )
 
             with self._transact(retry) as (sql, _):
-                rows = sql(select, (db_key, raw, time.time())).fetchall()
+                now = self._now()
+                rows = sql(select, (db_key, raw, now)).fetchall()
 
                 if not rows:
                     if self.statistics:
@@ -1192,7 +1511,18 @@ class Cache:
                     return default
 
                 (
-                    (rowid, db_expire_time, db_tag, mode, filename, db_value),
+                    (
+                        rowid,
+                        db_expire_time,
+                        db_tag,
+                        mode,
+                        filename,
+                        db_value,
+                        idle_ttl,
+                        idle_expire_time,
+                        hard_expire_time,
+                        store_time,
+                    ),
                 ) = rows  # noqa: E127
 
                 try:
@@ -1206,11 +1536,25 @@ class Cache:
                 if self.statistics:
                     sql(cache_hit)
 
-                now = time.time()
+                now = self._now()
                 update = 'UPDATE Cache SET %s WHERE rowid = ?'
 
                 if update_column is not None:
                     sql(update % update_column.format(now=now), (rowid,))
+
+                # Successful read: refresh the idle deadline (throttled and
+                # guarded so a concurrent set can never be overwritten).
+
+                if idle_ttl is not None:
+                    renew_row = (
+                        rowid,
+                        idle_ttl,
+                        idle_expire_time,
+                        hard_expire_time,
+                        db_expire_time,
+                        store_time,
+                    )
+                    self._renew_idle(sql, renew_row, now)
 
         if expire_time and tag:
             return (value, db_expire_time, db_tag)
@@ -1267,7 +1611,7 @@ class Cache:
             ' AND (expire_time IS NULL OR expire_time > ?)'
         )
 
-        rows = sql(select, (db_key, raw, time.time())).fetchall()
+        rows = sql(select, (db_key, raw, self._now())).fetchall()
 
         return bool(rows)
 
@@ -1306,7 +1650,7 @@ class Cache:
             default = default, None
 
         with self._transact(retry) as (sql, _):
-            rows = sql(select, (db_key, raw, time.time())).fetchall()
+            rows = sql(select, (db_key, raw, self._now())).fetchall()
 
             if not rows:
                 return default
@@ -1352,7 +1696,7 @@ class Cache:
                 'SELECT rowid, filename FROM Cache'
                 ' WHERE key = ? AND raw = ?'
                 ' AND (expire_time IS NULL OR expire_time > ?)',
-                (db_key, raw, time.time()),
+                (db_key, raw, self._now()),
             ).fetchall()
 
             if not rows:
@@ -1393,6 +1737,8 @@ class Cache:
         read=False,
         tag=None,
         retry=False,
+        idle=None,
+        hard=None,
     ):
         """Push `value` onto `side` of queue identified by `prefix` in cache.
 
@@ -1432,6 +1778,10 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds; `pull`/`get` read
+            hits refresh the deadline (default None, no idle expiry)
+        :param float hard: maximum lifetime in seconds, never extended
+            (default None, no hard deadline)
         :return: key for item in cache
         :raises Timeout: if database timeout occurs
 
@@ -1443,11 +1793,11 @@ class Cache:
             min_key = prefix + '-000000000000000'
             max_key = prefix + '-999999999999999'
 
-        now = time.time()
+        now = self._now()
         raw = True
-        expire_time = None if expire is None else now + expire
+        policy = self._policy_expire_time(now, expire, idle, hard)
         size, mode, filename, db_value = self._disk.store(value, read)
-        columns = (expire_time, tag, size, mode, filename, db_value)
+        columns = policy + (tag, size, mode, filename, db_value)
         order = {'back': 'DESC', 'front': 'ASC'}
         select = (
             'SELECT key FROM Cache'
@@ -1579,7 +1929,7 @@ class Cache:
 
                     sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
 
-                    if db_expire is not None and db_expire < time.time():
+                    if db_expire is not None and db_expire < self._now():
                         cleanup(name)
                     else:
                         break
@@ -1692,7 +2042,7 @@ class Cache:
                         (rowid, key, db_expire, db_tag, mode, name, db_value),
                     ) = rows
 
-                    if db_expire is not None and db_expire < time.time():
+                    if db_expire is not None and db_expire < self._now():
                         sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
                         cleanup(name)
                     else:
@@ -1768,7 +2118,7 @@ class Cache:
                         ),
                     ) = rows
 
-                    if db_expire is not None and db_expire < time.time():
+                    if db_expire is not None and db_expire < self._now():
                         sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
                         cleanup(name)
                     else:
@@ -2095,7 +2445,7 @@ class Cache:
             ' WHERE ? < expire_time AND expire_time < ?'
             ' ORDER BY expire_time LIMIT ?'
         )
-        args = [0, now or time.time(), 100]
+        args = [0, now or self._now(), 100]
         return self._select_delete(select, args, row_index=1, retry=retry)
 
     def cull(self, retry=False):
@@ -2116,7 +2466,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
 
         # Remove expired items.
 
@@ -2365,7 +2715,7 @@ class Cache:
         return self.reset('count')
 
     def __getstate__(self):
-        return (self.directory, self.timeout, type(self.disk))
+        return (self.directory, self.timeout, type(self.disk), self._clock)
 
     def __setstate__(self, state):
         self.__init__(*state)

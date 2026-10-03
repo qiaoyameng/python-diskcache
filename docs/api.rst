@@ -98,6 +98,9 @@ Read the :ref:`Settings tutorial <tutorial-settings>` for details.
      greater size are stored in files.
    * `disk_pickle_protocol` (int) default highest Pickle protocol - the Pickle
      protocol to use for data types that are not natively supported.
+   * `idle_renew_threshold` (float) default 0.1 - maximum fraction of an item's
+     idle TTL by which an idle-deadline refresh may be deferred. Bounds both
+     the write rate of hot keys and how early an idle item can expire.
 
 .. data:: diskcache.EVICTION_POLICY
 

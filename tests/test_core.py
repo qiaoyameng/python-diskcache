@@ -10,6 +10,7 @@ import pickle
 import shutil
 import sqlite3
 import subprocess as sp
+import sys
 import tempfile
 import threading
 import time
@@ -1405,3 +1406,379 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+# ---------------------------------------------------------------------------
+# Idle TTL and hard deadline expiry policy.
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """Deterministic POSIX-epoch clock for idle/hard deadline tests."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def policy_cache(tmp_path):
+    clock = FakeClock()
+    cache = dc.Cache(str(tmp_path), clock=clock, cull_limit=0)
+    yield cache, clock
+    cache.close()
+
+
+def _policy_row(cache, key):
+    return cache._sql(
+        'SELECT expire_time, idle_ttl, idle_expire_time, hard_expire_time'
+        ' FROM Cache WHERE key = ?',
+        (key,),
+    ).fetchall()[0]
+
+
+def test_clock_must_be_callable():
+    with pytest.raises(ValueError):
+        dc.Cache(clock=123)
+
+
+def test_set_idle_and_hard_columns(policy_cache):
+    cache, clock = policy_cache
+    assert cache.set('key', 'value', idle=600, hard=86400)
+
+    expire_time, idle_ttl, idle_expire, hard_expire = _policy_row(
+        cache, 'key'
+    )
+    assert idle_ttl == 600
+    assert idle_expire == clock() + 600
+    assert hard_expire == clock() + 86400
+    # Effective expiry is the earlier of the two deadlines.
+    assert expire_time == clock() + 600
+
+
+def test_idle_only_and_hard_only(policy_cache):
+    cache, clock = policy_cache
+
+    assert cache.set('idle', 1, idle=600)
+    expire_time, _, idle_expire, hard_expire = _policy_row(cache, 'idle')
+    assert idle_expire == expire_time == clock() + 600
+    assert hard_expire is None
+
+    assert cache.set('hard', 1, hard=3600)
+    expire_time, _, idle_expire, hard_expire = _policy_row(cache, 'hard')
+    assert hard_expire == expire_time == clock() + 3600
+    assert idle_expire is None
+
+
+def test_get_refreshes_idle_deadline(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=86400)
+
+    # Beyond the default 10% slack (60 seconds): a write is due.
+    clock.advance(61)
+    assert cache.get('key') == 'value'
+    expire_time, _, idle_expire, hard_expire = _policy_row(cache, 'key')
+    assert idle_expire == clock() + 600
+    assert expire_time == idle_expire
+    # Hard deadline is anchored at set time and never moves.
+    assert hard_expire == 1000 + 86400
+
+
+def test_idle_refresh_is_throttled(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=86400)
+    original = _policy_row(cache, 'key')[0]
+
+    # Within the slack: no database write.
+    clock.advance(30)
+    assert cache.get('key') == 'value'
+    assert _policy_row(cache, 'key')[0] == original
+
+    # Threshold of zero forces a write every time.
+    cache.reset('idle_renew_threshold', 0)
+    clock.advance(1)
+    assert cache.get('key') == 'value'
+    assert _policy_row(cache, 'key')[0] == clock() + 600
+
+
+def test_idle_expiry_after_inactivity(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=86400)
+
+    clock.advance(100)
+    assert cache.get('key') == 'value'
+    assert _policy_row(cache, 'key')[2] == clock() + 600
+
+    # No access for more than an idle TTL: key is gone.
+    clock.advance(601)
+    assert cache.get('key', default='missing') == 'missing'
+
+
+def test_hard_deadline_caps_continuous_reads(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=3600)
+
+    hard_deadline = 1000 + 3600
+
+    # Read constantly, renewing the idle deadline each time. As long as the
+    # hard deadline has not passed, idle renewal keeps the item live.
+    while clock() + 61 < hard_deadline:
+        clock.advance(61)
+        assert cache.get('key') == 'value'
+
+    assert clock() > 1000 + 600  # Well past a single idle TTL.
+
+    # One step past the hard deadline: gone despite continuous reads.
+    clock.now = hard_deadline + 1
+    assert cache.get('key', default='missing') == 'missing'
+    assert _policy_row(cache, 'key')[3] == hard_deadline
+
+
+def test_get_metadata_tuple_and_read_refresh(policy_cache):
+    cache, clock = policy_cache
+    payload = b'0123456789' * 10000  # Forces file-backed storage.
+    cache.set('key', payload, idle=600, hard=86400)
+    clock.advance(100)
+
+    handle, expire_time, tag = cache.get(
+        'key', read=True, expire_time=True, tag=True
+    )
+    assert tag is None
+    assert handle.read() == payload
+    # The returned tuple reflects the read row; the refresh write lands
+    # immediately after the fetch.
+    assert expire_time == 1600
+    assert _policy_row(cache, 'key')[2] == clock() + 600
+
+    handle.close()
+
+
+def test_index_access_refreshes(policy_cache, tmp_path):
+    index = dc.Index.fromcache(policy_cache[0])
+    clock = policy_cache[1]
+    index['key'] = 'value'
+    # Re-set with a policy because Index has no expiry arguments.
+    policy_cache[0].set('key', 'value', idle=600, hard=86400)
+    clock.advance(61)
+    assert index['key'] == 'value'
+    assert _policy_row(policy_cache[0], 'key')[2] == clock() + 600
+
+
+def test_contains_does_not_refresh(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=86400)
+    clock.advance(61)
+    assert 'key' in cache
+    assert _policy_row(cache, 'key')[2] == 1600
+
+
+def test_peek_and_pull_do_not_refresh(policy_cache):
+    cache, clock = policy_cache
+    cache.push('queued', idle=600, hard=86400)
+    key, _ = cache.peek()
+    clock.advance(61)
+    cache.peek()
+    _, idle_expire = cache._sql(
+        'SELECT key, idle_expire_time FROM Cache'
+    ).fetchall()[0]
+    assert idle_expire == 1600
+
+    # pull removes the item; it must not have refreshed it either.
+    assert cache.pull()[0] == key
+
+
+def test_missing_value_file_is_miss_without_refresh(policy_cache):
+    cache, clock = policy_cache
+    payload = b'x' * 100000
+    cache.set('key', payload, idle=600, hard=86400)
+    filename = cache._sql(
+        'SELECT filename FROM Cache WHERE key = ?', ('key',)
+    ).fetchall()[0][0]
+    os.remove(op.join(cache.directory, filename))
+
+    clock.advance(61)
+    assert cache.get('key', default='missing') == 'missing'
+    with pytest.raises(KeyError):
+        cache.read('key')
+    assert _policy_row(cache, 'key')[2] == 1600
+
+
+def test_refresh_does_not_overwrite_concurrent_set(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'v1', idle=600, hard=86400)
+    v1_store = 1000.0
+    clock.advance(61)
+    assert cache.get('key') == 'v1'
+
+    # A concurrent set replaces the row with a brand-new version.
+    clock.advance(10)
+    cache.set('key', 'v2', idle=900, hard=9000)
+    v2_store = clock()
+
+    # Replay a stale v1 renewal: the version guard must reject it.
+    rowid = cache._sql(
+        'SELECT rowid FROM Cache WHERE key = ?', ('key',)
+    ).fetchall()[0][0]
+    stale_row = (rowid, 600, 1661.0, 87400.0, 1661.0, v1_store)
+    with cache._transact(True) as (sql, _):
+        cache._renew_idle(sql, stale_row, clock())
+
+    row = cache._sql(
+        'SELECT store_time, idle_ttl, idle_expire_time, hard_expire_time,'
+        ' expire_time FROM Cache WHERE key = ?',
+        ('key',),
+    ).fetchall()[0]
+    assert row == (
+        v2_store,
+        900,
+        v2_store + 900,
+        v2_store + 9000,
+        v2_store + 900,
+    )
+
+
+def test_clock_rollback_does_not_extend_hard_deadline(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=86400)
+    clock.advance(200)
+    assert cache.get('key') == 'value'
+
+    clock.now = 900.0
+    assert cache.get('key') == 'value'
+    expire_time, _, idle_expire, hard_expire = _policy_row(cache, 'key')
+    assert hard_expire == 87400
+    # Throttled renewal: rolled-back ideal deadline is earlier, so no write.
+    assert idle_expire == 1800
+    assert expire_time == 1800
+
+
+def test_expire_and_hard_cannot_be_combined(policy_cache):
+    cache, _ = policy_cache
+    with pytest.raises(ValueError):
+        cache.set('key', 'value', expire=10, idle=10)
+    with pytest.raises(ValueError):
+        cache.set('key', 'value', expire=10, hard=10)
+    assert cache.get('key', default='missing') == 'missing'
+
+
+def test_touch_policy(policy_cache):
+    cache, clock = policy_cache
+    cache.set('key', 'value', idle=600, hard=86400)
+    clock.advance(100)
+
+    assert cache.touch('key', idle=300, hard=400)
+    expire_time, idle_ttl, idle_expire, hard_expire = _policy_row(
+        cache, 'key'
+    )
+    assert idle_ttl == 300
+    assert idle_expire == clock() + 300
+    assert hard_expire == clock() + 400
+    assert expire_time == clock() + 300
+
+    # Touching a missing or expired key fails.
+    assert not cache.touch('missing', idle=1)
+    clock.advance(500)
+    assert not cache.touch('key', idle=1)
+
+
+def test_fixed_expire_remains_legacy(policy_cache):
+    cache, clock = policy_cache
+    cache.set('fixed', 1, expire=10)
+    expire_time, idle_ttl, idle_expire, hard_expire = _policy_row(
+        cache, 'fixed'
+    )
+    assert expire_time == clock() + 10
+    assert (idle_ttl, idle_expire, hard_expire) == (None, None, None)
+
+    # Reads never alter a fixed expiry.
+    clock.advance(5)
+    assert cache.get('fixed') == 1
+    assert _policy_row(cache, 'fixed')[0] == expire_time
+
+    clock.advance(6)
+    assert cache.get('fixed', default='missing') == 'missing'
+
+
+def test_migrated_database_keeps_legacy_rows(tmp_path):
+    # Build a database with the old schema, then reopen with new code.
+    connection = sqlite3.connect(str(tmp_path / 'cache.db'))
+    connection.execute(
+        'CREATE TABLE Cache ('
+        ' rowid INTEGER PRIMARY KEY,'
+        ' key BLOB, raw INTEGER, store_time REAL, expire_time REAL,'
+        ' access_time REAL, access_count INTEGER DEFAULT 0,'
+        ' tag BLOB, size INTEGER DEFAULT 0, mode INTEGER DEFAULT 0,'
+        ' filename TEXT, value BLOB)'
+    )
+    connection.execute(
+        'CREATE TABLE Settings (key TEXT NOT NULL UNIQUE, value)'
+    )
+    connection.execute(
+        "INSERT INTO Settings VALUES ('statistics', 0)"
+    )
+    connection.execute(
+        'INSERT INTO Cache (key, raw, store_time, expire_time, mode,'
+        ' value) VALUES (?, 1, 1.0, 9999999999.0, 1, ?)',
+        ('old', 'data'),
+    )
+    connection.commit()
+    connection.close()
+
+    cache = dc.Cache(str(tmp_path))
+    try:
+        # No policy columns are back-filled for the historical row.
+        row = cache._sql(
+            'SELECT expire_time, idle_ttl, idle_expire_time,'
+            ' hard_expire_time FROM Cache'
+        ).fetchall()[0]
+        assert row == (9999999999.0, None, None, None)
+        assert cache.get('old') == 'data'
+    finally:
+        cache.close()
+
+
+def test_idle_hard_with_fanout_cache(tmp_path):
+    cache = dc.FanoutCache(str(tmp_path), shards=4)
+    try:
+        assert cache.set('key', 'value', idle=60, hard=3600)
+        assert cache.get('key') == 'value'
+        assert cache.touch('key', idle=30, hard=60)
+    finally:
+        cache.close()
+
+
+def test_idle_policy_across_processes(tmp_path):
+    # Deadlines are persisted as POSIX epoch seconds, so a separate process
+    # interprets the same idle/hard deadlines.
+    directory = str(tmp_path)
+
+    def run(code):
+        sp.check_call(
+            [sys.executable, '-c', code, directory],
+            stdout=sp.DEVNULL,
+        )
+
+    run(
+        "import sys, diskcache as dc;"
+        " c = dc.Cache(sys.argv[1]);"
+        " c.set('k', 'v', idle=2, hard=30);"
+        " c.close()"
+    )
+    run(
+        "import sys, diskcache as dc;"
+        " c = dc.Cache(sys.argv[1]);"
+        " assert c.get('k') == 'v';"
+        " c.close()"
+    )
+    time.sleep(2.5)
+    run(
+        "import sys, diskcache as dc;"
+        " c = dc.Cache(sys.argv[1]);"
+        " assert c.get('k', default='miss') == 'miss';"
+        " c.close()"
+    )

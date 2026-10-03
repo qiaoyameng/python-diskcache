@@ -99,11 +99,24 @@ class FanoutCache:
                 stack.enter_context(shard_transaction)
             yield
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        idle=None,
+        hard=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        See :meth:`diskcache.Cache.set` for the `expire`, `idle`, and
+        `hard` expiry policy arguments.
 
         If database timeout occurs then fails silently unless `retry` is set to
         `True` (default `False`).
@@ -115,13 +128,24 @@ class FanoutCache:
         :param bool read: read value as raw bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds (default None)
+        :param float hard: maximum lifetime in seconds (default None)
         :return: True if item was set
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.set(key, value, expire, read, tag, retry)
+            return shard.set(
+                key,
+                value,
+                expire=expire,
+                read=read,
+                tag=tag,
+                retry=retry,
+                idle=idle,
+                hard=hard,
+            )
         except Timeout:
             return False
 
@@ -138,8 +162,11 @@ class FanoutCache:
         shard = self._shards[index]
         shard[key] = value
 
-    def touch(self, key, expire=None, retry=False):
+    def touch(self, key, expire=None, retry=False, idle=None, hard=None):
         """Touch `key` in cache and update `expire` time.
+
+        See :meth:`diskcache.Cache.touch` for the `expire`, `idle`, and
+        `hard` expiry policy arguments.
 
         If database timeout occurs then fails silently unless `retry` is set to
         `True` (default `False`).
@@ -148,17 +175,35 @@ class FanoutCache:
         :param float expire: seconds until the key expires
             (default None, no expiry)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds (default None)
+        :param float hard: maximum lifetime in seconds (default None)
         :return: True if key was touched
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.touch(key, expire, retry)
+            return shard.touch(
+                key,
+                expire=expire,
+                retry=retry,
+                idle=idle,
+                hard=hard,
+            )
         except Timeout:
             return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        idle=None,
+        hard=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -168,6 +213,9 @@ class FanoutCache:
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        See :meth:`diskcache.Cache.add` for the `expire`, `idle`, and
+        `hard` expiry policy arguments.
 
         If database timeout occurs then fails silently unless `retry` is set to
         `True` (default `False`).
@@ -179,13 +227,24 @@ class FanoutCache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle: idle time-to-live in seconds (default None)
+        :param float hard: maximum lifetime in seconds (default None)
         :return: True if item was added
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.add(key, value, expire, read, tag, retry)
+            return shard.add(
+                key,
+                value,
+                expire=expire,
+                read=read,
+                tag=tag,
+                retry=retry,
+                idle=idle,
+                hard=hard,
+            )
         except Timeout:
             return False
 

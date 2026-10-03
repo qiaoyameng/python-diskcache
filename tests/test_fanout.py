@@ -683,3 +683,33 @@ def test_custom_filename_disk():
             assert content == str(count) * int(1e5)
 
     shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_idle_hard_policy_fanout(cache):
+    assert cache.set('key', 'value', idle=0.2, hard=30)
+    assert cache.get('key') == 'value'
+
+    shard = cache._shards[cache._hash('key') % cache._count]
+    row = shard._sql(
+        'SELECT idle_ttl, idle_expire_time, hard_expire_time'
+        ' FROM Cache WHERE key = ?',
+        ('key',),
+    ).fetchall()[0]
+    assert row[0] == 0.2
+    assert row[2] is not None
+
+    # Continual reads refresh the idle deadline, keeping the key alive.
+    for _ in range(5):
+        time.sleep(0.05)
+        assert cache.get('key') == 'value'
+
+    # After 0.2s without access, the idle deadline expires.
+    time.sleep(0.25)
+    assert cache.get('key', default='missing') == 'missing'
+
+    # touch accepts the policy arguments too.
+    assert cache.set('touched', 1, idle=0.2, hard=30)
+    assert cache.touch('touched', idle=0.5, hard=60)
+
+    with pytest.raises(ValueError):
+        cache.set('bad', 1, expire=1, idle=1)

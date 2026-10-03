@@ -228,7 +228,56 @@ includes expired items because it is a read-only operation. To exclude expired
 items you must explicitly call :meth:`expire <diskcache.Cache.expire>` which
 works regardless of the :ref:`cull_limit <tutorial-settings>`.
 
-    >>> for num in range(100):
+Idle Time-To-Live and Hard Deadline
+------------------------------------
+
+Sometimes an item should expire when nobody has used it for a while, yet no
+item should be kept longer than an absolute maximum lifetime regardless of how
+hot it is. :meth:`set <diskcache.Cache.set>`, :meth:`add
+<diskcache.Cache.add>`, :meth:`touch <diskcache.Cache.touch>`, and
+:meth:`push <diskcache.Cache.push>` accept two optional keyword parameters:
+
+* `idle` is the idle time-to-live in seconds. Every successful read of the
+  item refreshes its idle deadline to "read time + idle". Missing keys,
+  expired keys, and failures reading a value file are not successful accesses
+  and do not refresh anything.
+* `hard` is the maximum lifetime in seconds measured from the moment the item
+  is written. The hard deadline is absolute, is never extended by reads, and
+  is unaffected by the system clock being moved backwards.
+
+The item expires at the earlier of the two deadlines. The classic "expire
+after ten minutes idle, but never keep longer than a day" policy is::
+
+    cache.set(key, value, idle=600, hard=86400)
+
+Successful accesses are :meth:`get <diskcache.Cache.get>` (including
+``cache[key]``, ``read=True``, and the ``expire_time``/``tag`` metadata
+tuples), :meth:`read <diskcache.Cache.read>`, and indexing through
+:class:`Index <diskcache.Index>` and :class:`Deque <diskcache.Deque>`. The
+queue-style :meth:`peek <diskcache.Cache.peek>`/
+:meth:`peekitem <diskcache.Cache.peekitem>` methods, membership tests
+(``key in cache``), and iteration deliberately do not refresh the deadline.
+
+Refreshing a very hot key on every read would mean a database write per read.
+The refresh is throttled by the ``idle_renew_threshold`` setting (a fraction
+of the idle TTL, default ``0.1``): a refreshed deadline is only persisted once
+the stored deadline lags by more than that fraction, so an item may be served
+at most 10% (by default) past its true idle expiry after its process stops
+reading it. Set ``idle_renew_threshold`` to ``0`` to persist every refresh.
+
+The refresh is also guarded by the item's version: a read of one version can
+never overwrite the deadlines written by a concurrent :meth:`set
+<diskcache.Cache.set>` of a newer version.
+
+The legacy fixed `expire` parameter keeps its original meaning and cannot be
+combined with `idle` or `hard`. Databases created by older releases are
+migrated automatically; their historical rows receive no policy and keep
+fixed-expiry semantics.
+
+All times are POSIX epoch seconds, so separate processes interpret the same
+deadlines. The clock is injectable for deterministic testing::
+
+   >>> for num in range(100):
     ...     _ = cache.set(num, num, tag='odd' if num % 2 else 'even')
     >>> cache.evict('even')
     50
