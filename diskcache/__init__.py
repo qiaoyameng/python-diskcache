@@ -13,11 +13,18 @@ from .core import (
     Cache,
     Disk,
     EmptyDirWarning,
+    GenerationMismatchError,
     JSONDisk,
     Timeout,
     UnknownFileWarning,
 )
-from .fanout import FanoutCache
+from .fanout import (
+    MANIFEST_NAME,
+    MIGRATION_NAME,
+    FanoutCache,
+    FanoutLayoutError,
+    FanoutMigrationInProgress,
+)
 from .persistent import Deque, Index
 from .recipes import (
     Averager,
@@ -40,6 +47,9 @@ __all__ = [
     'EVICTION_POLICY',
     'EmptyDirWarning',
     'FanoutCache',
+    'FanoutLayoutError',
+    'FanoutMigrationInProgress',
+    'GenerationMismatchError',
     'Index',
     'JSONDisk',
     'Lock',

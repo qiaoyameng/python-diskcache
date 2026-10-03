@@ -2,7 +2,9 @@
 
 import contextlib as cl
 import functools
+import json
 import itertools as it
+import os
 import operator
 import os.path as op
 import sqlite3
@@ -11,6 +13,146 @@ import time
 
 from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
 from .persistent import Deque, Index
+
+
+MANIFEST_NAME = 'fanout-manifest.json'
+MIGRATION_NAME = 'fanout-migration.json'
+
+MANIFEST_VERSION = 1
+
+
+class FanoutLayoutError(Exception):
+    """Raised when a fanout directory cannot be opened with a given layout."""
+
+
+class FanoutMigrationInProgress(Exception):
+    """Raised when opening a fanout cache during a shard migration.
+
+    During the copy and verify phases the source layout can still be
+    opened at its original shard count for reads (writes fail on the
+    maintenance write locks). This exception is raised when the requested
+    shard count does not match the source layout or when the migration is
+    cutting over (directories are being renamed).
+
+    """
+
+
+def _disk_name(disk):
+    return getattr(disk, '__module__', '') + '.' + disk.__qualname__
+
+
+def _atomic_json(path, payload):
+    """Write `payload` as JSON to `path` atomically (temp file + replace)."""
+    directory = op.dirname(path)
+    descriptor, tmp_path = tempfile.mkstemp(
+        prefix=op.basename(path) + '.', suffix='.tmp', dir=directory
+    )
+    try:
+        with cl.closing(os.fdopen(descriptor, 'w', encoding='utf-8')) as writer:
+            json.dump(payload, writer, indent=2, sort_keys=True)
+            writer.write('\n')
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with cl.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _read_manifest(directory):
+    path = op.join(directory, MANIFEST_NAME)
+
+    try:
+        with open(path, 'r', encoding='utf-8') as reader:
+            return json.load(reader)
+    except FileNotFoundError:
+        return None
+
+
+def _write_manifest(directory, shards, disk_name, generation):
+    payload = {
+        'version': MANIFEST_VERSION,
+        'shards': shards,
+        'disk': disk_name,
+        'generation': generation,
+    }
+    _atomic_json(op.join(directory, MANIFEST_NAME), payload)
+    return payload
+
+
+def _legacy_shards(directory):
+    """Detect a pre-manifest fanout directory and return its shard count."""
+    count = 0
+
+    while op.isdir(op.join(directory, '%03d' % count)):
+        count += 1
+
+    return count
+
+
+def _bootstrap_manifest(directory, shards, disk_name, generation):
+    """Create the manifest for a legacy fanout directory.
+
+    Takes an exclusive cross-process lock so two processes opening a legacy
+    cache at the same time do not race writing the manifest. The lock is
+    released as soon as the manifest is on disk.
+
+    """
+    lock_path = op.join(directory, '.fanout-manifest.lock')
+
+    while True:
+        try:
+            lock_fd = os.open(
+                lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+            )
+        except FileExistsError:
+            # Another process is bootstrapping. Wait briefly and retry until
+            # the manifest appears or the stale lock is reclaimed.
+            time.sleep(0.02)
+
+            if _read_manifest(directory) is not None:
+                return _read_manifest(directory)
+
+            try:
+                age = time.time() - op.getmtime(lock_path)
+            except FileNotFoundError:
+                continue
+
+            if age > 60:
+                with cl.suppress(OSError):
+                    os.remove(lock_path)
+            continue
+        else:
+            break
+
+    try:
+        manifest = _read_manifest(directory)
+
+        if manifest is None:
+            # Backfill fanout_generation in every legacy shard.
+
+            for num in range(shards):
+                db_path = op.join(directory, '%03d' % num, 'cache.db')
+                con = sqlite3.connect(db_path, timeout=60)
+                try:
+                    con.execute(
+                        'INSERT OR IGNORE INTO Settings VALUES (?, ?)',
+                        ('fanout_generation', generation),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+
+            manifest = _write_manifest(
+                directory, shards, disk_name, generation
+            )
+
+        return manifest
+    finally:
+        os.close(lock_fd)
+        with cl.suppress(OSError):
+            os.remove(lock_path)
 
 
 class FanoutCache:
@@ -34,22 +176,151 @@ class FanoutCache:
         directory = op.expanduser(directory)
         directory = op.expandvars(directory)
 
+        os.makedirs(directory, exist_ok=True)
+
+        # A migration holding the cache in maintenance mode blocks all
+        # normal opens (reads included) so writers using the old layout
+        # cannot race the migration.
+
+        migration_path = op.join(directory, MIGRATION_NAME)
+        migration = None
+
+        if op.exists(migration_path):
+            with cl.suppress(OSError, ValueError):
+                with open(migration_path, 'r', encoding='utf-8') as reader:
+                    migration = json.load(reader)
+
+            status = migration.get('status') if migration else None
+
+            if status == 'aborted':
+                # An aborted migration leaves the source layout untouched;
+                # ignore the stale migration record on open.
+                migration = None
+            elif status in ('copying', 'verifying'):
+                source_layout = migration.get('source', {})
+
+                if source_layout.get('shards') != shards:
+                    raise FanoutMigrationInProgress(
+                        'migration of %r is redistributing %d shard(s);'
+                        ' the source layout can only be opened read-only'
+                        ' with shards=%d'
+                        % (
+                            directory,
+                            source_layout.get('shards'),
+                            source_layout.get('shards'),
+                        )
+                    )
+            elif status == 'cutting-over':
+                raise FanoutMigrationInProgress(
+                    'migration of %r is cutting over; re-open shortly'
+                    % directory
+                )
+            elif status != 'complete':
+                phase = migration.get('phase') if migration else None
+                raise FanoutMigrationInProgress(
+                    'a shard migration is in progress on %r (phase=%r);'
+                    ' wait for it to finish or abort it'
+                    % (directory, phase)
+                )
+
+        disk_name = _disk_name(disk)
+        manifest = _read_manifest(directory)
+
+        if migration is not None and migration.get('status') != 'complete':
+            # Reuse the on-disk source manifest for the rest of init so the
+            # shards open with the source generation.
+            generation = migration['source']['generation']
+
+            if manifest is not None and manifest.get('shards') != shards:
+                raise FanoutLayoutError(
+                    'manifest at %r records %d shard(s) but the active'
+                    ' migration source has %d'
+                    % (
+                        directory,
+                        manifest.get('shards'),
+                        shards,
+                    )
+                )
+
+            manifest = {
+                'shards': shards,
+                'disk': disk_name,
+                'generation': generation,
+            }
+
+        if manifest is None:
+            legacy = _legacy_shards(directory)
+
+            if legacy:
+                if shards != legacy:
+                    raise FanoutLayoutError(
+                        'legacy fanout cache at %r has %d shard(s) but %d'
+                        ' requested; use diskcache.migration to change the'
+                        ' shard count' % (directory, legacy, shards)
+                    )
+
+                manifest = _bootstrap_manifest(
+                    directory, legacy, disk_name, generation=1
+                )
+            else:
+                manifest = _write_manifest(
+                    directory, shards, disk_name, generation=1
+                )
+
+        if manifest.get('shards') != shards:
+            raise FanoutLayoutError(
+                '%r is laid out with %d shard(s) (generation %s) but %d'
+                ' were requested; re-open with shards=%d or migrate'
+                % (
+                    directory,
+                    manifest.get('shards'),
+                    manifest.get('generation'),
+                    shards,
+                    manifest.get('shards'),
+                )
+            )
+
+        if manifest.get('disk') != disk_name:
+            raise FanoutLayoutError(
+                'fanout cache at %r uses disk %r but %r was given'
+                % (directory, manifest.get('disk'), disk_name)
+            )
+
+        generation = manifest.get('generation')
+
         default_size_limit = DEFAULT_SETTINGS['size_limit']
         size_limit = settings.pop('size_limit', default_size_limit) / shards
 
         self._count = shards
         self._directory = directory
         self._disk = disk
+        self._generation = generation
         self._shards = tuple(
             Cache(
                 directory=op.join(directory, '%03d' % num),
                 timeout=timeout,
                 disk=disk,
                 size_limit=size_limit,
+                fanout_generation=generation,
                 **settings,
             )
             for num in range(shards)
         )
+
+        stale = [
+            num
+            for num, shard in enumerate(self._shards)
+            if shard.fanout_generation != generation
+        ]
+
+        if stale:
+            details = ', '.join('%03d' % num for num in stale)
+            raise FanoutLayoutError(
+                'shards %s of %r report layout generation(s) that do not'
+                ' match the manifest (%s); the cache needs repair'
+                % (details, directory, generation)
+            )
+
         self._hash = self._shards[0].disk.hash
         self._caches = {}
         self._deques = {}
@@ -59,6 +330,16 @@ class FanoutCache:
     def directory(self):
         """Cache directory."""
         return self._directory
+
+    @property
+    def shards(self):
+        """Number of shards in the active layout."""
+        return self._count
+
+    @property
+    def generation(self):
+        """Active layout generation."""
+        return self._generation
 
     def __getattr__(self, name):
         safe_names = {'timeout', 'disk'}

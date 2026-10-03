@@ -130,3 +130,15 @@ Timeout
 -------
 
 .. autoexception:: diskcache.Timeout
+
+Shard Migration
+---------------
+
+Changing the ``shards`` argument of a running :class:`FanoutCache` alone is
+not supported: keys are routed by ``hash(key) % shards`` so rows would be
+read from the wrong shard. Use :func:`diskcache.migration.migrate` to
+redistribute an existing fanout cache over a new shard count.
+
+.. automodule:: diskcache.migration
+   :members: migrate, abort_migrate, layout_info, MigrationResult
+   :special-members:

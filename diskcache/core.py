@@ -384,6 +384,17 @@ class EmptyDirWarning(UserWarning):
     """Warning used by Cache.check for empty directories."""
 
 
+class GenerationMismatchError(Exception):
+    """Cache layout changed underneath the open connection.
+
+    Raised by write transactions on a shard whose layout generation is
+    newer than the generation observed when the connection was opened. This
+    prevents processes holding a stale layout from writing to a cache after
+    a shard migration (see :mod:`diskcache.migration`).
+
+    """
+
+
 def args_to_key(base, args, kwargs, typed, ignore):
     """Create cache key out of function arguments.
 
@@ -470,6 +481,10 @@ class Cache:
 
         for key in METADATA:
             sets.pop(key, None)
+
+        # Managed below: guards write transactions for fanout shards.
+
+        guarded_generation = sets.pop('fanout_generation', None)
 
         # Chance to set pragmas before any tables are created.
 
@@ -584,11 +599,42 @@ class Cache:
         else:
             self.drop_tag_index()
 
+        # Store fanout layout generation when the cache is used as a shard of
+        # a FanoutCache. Plain Cache instances leave it unset (None).
+
+        if guarded_generation is not None:
+            sql(
+                'INSERT OR IGNORE INTO Settings VALUES (?, ?)',
+                ('fanout_generation', guarded_generation),
+            )
+        else:
+            sql(
+                'INSERT OR IGNORE INTO Settings VALUES (?, NULL)',
+                ('fanout_generation',),
+            )
+
+        ((self._fanout_generation,),) = sql(
+            'SELECT value FROM Settings WHERE key = ?',
+            ('fanout_generation',),
+        ).fetchall()
+
         # Close and re-open database connection with given timeout.
 
         self.close()
         self._timeout = timeout
         self._sql  # pylint: disable=pointless-statement
+
+    @property
+    def fanout_generation(self):
+        """Layout generation guarding write transactions, or None.
+
+        When the cache is a shard of a :class:`FanoutCache`, write
+        transactions verify that the generation stored in the Settings table
+        still matches this value. A shard migration bumps the generation to
+        invalidate processes holding the old layout.
+
+        """
+        return self._fanout_generation
 
     @property
     def directory(self):
@@ -719,6 +765,23 @@ class Cache:
             while True:
                 try:
                     sql('BEGIN IMMEDIATE')
+                    generation = self._fanout_generation
+
+                    if generation is not None:
+                        ((current,),) = sql(
+                            'SELECT value FROM Settings'
+                            ' WHERE key = ?',
+                            ('fanout_generation',),
+                        ).fetchall()
+
+                        if current != generation:
+                            sql('ROLLBACK')
+                            raise GenerationMismatchError(
+                                'cache layout generation changed: '
+                                'this process opened %s but the cache now '
+                                'uses %s; re-open the cache'
+                                % (generation, current)
+                            )
                     begin = True
                     self._txn_id = tid
                     break

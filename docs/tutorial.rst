@@ -473,6 +473,46 @@ Observe the lack of parenthenses after :meth:`memoize
 
 .. _`Sharding`: https://en.wikipedia.org/wiki/Shard_(database_architecture)
 
+.. _tutorial-fanout-migration:
+
+Migrating Shard Count
+~~~~~~~~~~~~~~~~~~~~~
+
+A cache initialized with ``shards=4`` cannot simply be re-opened with
+``shards=8``: keys are routed to shards by ``hash(key) % shards`` and almost
+every key would move. :mod:`diskcache.migration` performs an offline
+migration instead.
+
+Stop writers (reads may continue) and run::
+
+    >>> from diskcache.migration import migrate
+    >>> result = migrate('/path/to/cache', shards=8)  # doctest: +SKIP
+
+Or from the command line::
+
+    $ diskcache migrate /path/to/cache --shards 8
+
+The migration:
+
+1. Takes an exclusive maintenance lock and holds write transactions on the
+   source shards, blocking writers while readers keep working.
+2. Copies every row into a staging layout using the new modulus. Key
+   encoding, value columns, absolute ``expire_time`` and ``tag`` are
+   preserved. Large values are physically copied into the new shard
+   directories -- the new layout never references old files.
+3. Re-reads and compares every row and value file, then runs ``check()``
+   on every target shard.
+4. Bumps the layout generation, moves old shards aside, moves new shards
+   into place, and atomically publishes ``fanout-manifest.json``. Processes
+   still open on the old layout fail writes with
+   :class:`diskcache.GenerationMismatchError` and must re-open.
+
+Progress and verification details are persisted in
+``fanout-migration.json``; re-running the command resumes an interrupted
+migration. Use :func:`diskcache.migration.abort_migrate` before cutover to
+cancel, and :func:`diskcache.migration.layout_info` to inspect the active
+layout and migration state.
+
 .. _tutorial-djangocache:
 
 DjangoCache
