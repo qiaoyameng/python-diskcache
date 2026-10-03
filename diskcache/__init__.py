@@ -13,11 +13,23 @@ from .core import (
     Cache,
     Disk,
     EmptyDirWarning,
+    GenerationChanged,
     JSONDisk,
+    MaintenanceMode,
     Timeout,
     UnknownFileWarning,
 )
 from .fanout import FanoutCache
+from .migration import (
+    MigrationDiskSpaceError,
+    MigrationError,
+    MigrationInProgress,
+    MigrationStateError,
+    MigrationValidationError,
+    MigrationValueFileError,
+    cancel_migration,
+    migrate_shards,
+)
 from .persistent import Deque, Index
 from .recipes import (
     Averager,
@@ -40,15 +52,25 @@ __all__ = [
     'EVICTION_POLICY',
     'EmptyDirWarning',
     'FanoutCache',
+    'GenerationChanged',
     'Index',
     'JSONDisk',
     'Lock',
+    'MaintenanceMode',
+    'MigrationDiskSpaceError',
+    'MigrationError',
+    'MigrationInProgress',
+    'MigrationStateError',
+    'MigrationValidationError',
+    'MigrationValueFileError',
     'RLock',
     'Timeout',
     'UNKNOWN',
     'UnknownFileWarning',
     'barrier',
+    'cancel_migration',
     'memoize_stampede',
+    'migrate_shards',
     'throttle',
 ]
 

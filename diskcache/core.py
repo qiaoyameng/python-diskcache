@@ -16,6 +16,7 @@ import struct
 import tempfile
 import threading
 import time
+import urllib.parse
 import warnings
 import zlib
 
@@ -376,6 +377,14 @@ class Timeout(Exception):
     """Database timeout expired."""
 
 
+class GenerationChanged(Exception):
+    """Cache generation changed after the instance was opened."""
+
+
+class MaintenanceMode(Exception):
+    """Cache generation is in maintenance mode."""
+
+
 class UnknownFileWarning(UserWarning):
     """Warning used by Cache.check for unknown files."""
 
@@ -417,7 +426,14 @@ def args_to_key(base, args, kwargs, typed, ignore):
 class Cache:
     """Disk and file backed cache."""
 
-    def __init__(self, directory=None, timeout=60, disk=Disk, **settings):
+    def __init__(
+        self,
+        directory=None,
+        timeout=60,
+        disk=Disk,
+        read_only=False,
+        **settings,
+    ):
         """Initialize cache instance.
 
         :param str directory: cache directory
@@ -441,6 +457,8 @@ class Cache:
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
         self._txn_id = None
+        self._write_fence = None
+        self._read_only = read_only
 
         if not op.isdir(directory):
             try:
@@ -454,6 +472,38 @@ class Cache:
                     ) from None
 
         sql = self._sql_retry
+
+        if read_only:
+            current_settings = dict(
+                sql('SELECT key, value FROM Settings').fetchall()
+            )
+            sets = DEFAULT_SETTINGS.copy()
+            sets.update(current_settings)
+            for key in METADATA:
+                sets.pop(key, None)
+
+            kwargs = {
+                key[5:]: value
+                for key, value in sets.items()
+                if key.startswith('disk_')
+            }
+            self._disk = disk(directory, **kwargs)
+
+            for key, value in sets.items():
+                if not key.startswith('sqlite_'):
+                    setattr(self, key, value)
+
+            for key, value in METADATA.items():
+                try:
+                    self.reset(key)
+                except sqlite3.OperationalError:
+                    setattr(self, key, value)
+
+            ((self._page_size,),) = sql('PRAGMA page_size').fetchall()
+            self.close()
+            self._timeout = timeout
+            self._sql  # pylint: disable=pointless-statement
+            return
 
         # Setup Settings table.
 
@@ -621,9 +671,17 @@ class Cache:
 
         if con is None:
             con = self._local.con = sqlite3.connect(
-                op.join(self._directory, DBNAME),
+                (
+                    'file:%s?mode=ro'
+                    % urllib.parse.quote(
+                        op.join(self._directory, DBNAME), safe='/'
+                    )
+                )
+                if self._read_only
+                else op.join(self._directory, DBNAME),
                 timeout=self._timeout,
                 isolation_level=None,
+                uri=self._read_only,
             )
 
             # Some SQLite pragmas work on a per-connection basis so
@@ -639,7 +697,10 @@ class Cache:
             else:
                 for key, value in settings:
                     if key.startswith('sqlite_'):
-                        self.reset(key, value, update=False)
+                        if self._read_only:
+                            setattr(self, key, value)
+                        else:
+                            self.reset(key, value, update=False)
 
         return con
 
@@ -705,6 +766,11 @@ class Cache:
         with self._transact(retry=retry):
             yield
 
+    def _write_fence_check(self):
+        write_fence = self._write_fence
+        if write_fence is not None:
+            write_fence()
+
     @cl.contextmanager
     def _transact(self, retry=False, filename=None):
         sql = self._sql
@@ -718,7 +784,12 @@ class Cache:
         else:
             while True:
                 try:
+                    write_fence = self._write_fence
+                    if write_fence is not None:
+                        write_fence()
                     sql('BEGIN IMMEDIATE')
+                    if write_fence is not None:
+                        write_fence()
                     begin = True
                     self._txn_id = tid
                     break
@@ -769,6 +840,7 @@ class Cache:
         now = time.time()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
+        self._write_fence_check()
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
         columns = (expire_time, tag, size, mode, filename, db_value)
 
@@ -989,6 +1061,7 @@ class Cache:
         now = time.time()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
+        self._write_fence_check()
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
         columns = (expire_time, tag, size, mode, filename, db_value)
 
@@ -1041,6 +1114,7 @@ class Cache:
 
         """
         now = time.time()
+        self._write_fence_check()
         db_key, raw = self._disk.put(key)
         select = (
             'SELECT rowid, expire_time, filename, value FROM Cache'
@@ -1446,6 +1520,7 @@ class Cache:
         now = time.time()
         raw = True
         expire_time = None if expire is None else now + expire
+        self._write_fence_check()
         size, mode, filename, db_value = self._disk.store(value, read)
         columns = (expire_time, tag, size, mode, filename, db_value)
         order = {'back': 'DESC', 'front': 'ASC'}
@@ -2365,10 +2440,19 @@ class Cache:
         return self.reset('count')
 
     def __getstate__(self):
-        return (self.directory, self.timeout, type(self.disk))
+        return (
+            self.directory,
+            self.timeout,
+            type(self.disk),
+            self._read_only,
+        )
 
     def __setstate__(self, state):
-        self.__init__(*state)
+        if len(state) == 3:
+            directory, timeout, disk_type = state
+            self.__init__(directory, timeout, disk_type)
+        else:
+            self.__init__(*state)
 
     def reset(self, key, value=ENOVAL, update=True):
         """Reset `key` and `value` item from Settings table.

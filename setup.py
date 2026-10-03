@@ -36,6 +36,7 @@ setup(
     },
     license='Apache 2.0',
     packages=['diskcache'],
+    entry_points={'console_scripts': ['diskcache=diskcache.cli:main']},
     tests_require=['tox'],
     cmdclass={'test': Tox},
     python_requires='>=3',

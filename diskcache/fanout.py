@@ -9,8 +9,21 @@ import sqlite3
 import tempfile
 import time
 
-from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
+from .core import (
+    DEFAULT_SETTINGS,
+    ENOVAL,
+    Cache,
+    Disk,
+    Timeout,
+)
 from .persistent import Deque, Index
+from .routes import (
+    check_generation,
+    layout_from_route,
+    open_route,
+    route_signature,
+    shard_path,
+)
 
 
 class FanoutCache:
@@ -34,22 +47,48 @@ class FanoutCache:
         directory = op.expanduser(directory)
         directory = op.expandvars(directory)
 
-        default_size_limit = DEFAULT_SETTINGS['size_limit']
-        size_limit = settings.pop('size_limit', default_size_limit) / shards
-
-        self._count = shards
         self._directory = directory
         self._disk = disk
+        size_limit_total = settings.pop(
+            'size_limit', DEFAULT_SETTINGS['size_limit']
+        )
+        route, route_exists = open_route(
+            directory,
+            shards,
+            size_limit_total,
+        )
+        self._count = route['shards']
+        self._route = route
+        self._route_exists = route_exists
+        self._generation = layout_from_route(route)
+        self._route_signature = route_signature(directory, route_exists)
+
+        def write_fence():
+            current_route, current_signature = check_generation(
+                directory,
+                self._generation,
+                self._route_exists,
+                self._route_signature,
+            )
+            self._route = current_route
+            self._route_signature = current_signature
+
+        self._write_fence = write_fence
+
+        size_limit_total = route.get('size_limit', size_limit_total)
+        size_limit = size_limit_total / self._count
         self._shards = tuple(
             Cache(
-                directory=op.join(directory, '%03d' % num),
+                directory=shard_path(directory, self._generation, num),
                 timeout=timeout,
                 disk=disk,
                 size_limit=size_limit,
                 **settings,
             )
-            for num in range(shards)
+            for num in range(self._count)
         )
+        for cache in self._shards:
+            cache._write_fence = write_fence  # pylint: disable=protected-access
         self._hash = self._shards[0].disk.hash
         self._caches = {}
         self._deques = {}
@@ -59,6 +98,26 @@ class FanoutCache:
     def directory(self):
         """Cache directory."""
         return self._directory
+
+    @property
+    def generation(self):
+        """Layout generation opened by this cache instance."""
+        return self._generation['generation']
+
+    @property
+    def maintenance(self):
+        """Whether the active route is in maintenance mode."""
+        return self._route.get('maintenance', False)
+
+    def _check_write(self):
+        current_route, current_signature = check_generation(
+            self._directory,
+            self._generation,
+            self._route_exists,
+            self._route_signature,
+        )
+        self._route = current_route
+        self._route_signature = current_signature
 
     def __getattr__(self, name):
         safe_names = {'timeout', 'disk'}
@@ -405,6 +464,8 @@ class FanoutCache:
         :raises Timeout: if database timeout occurs
 
         """
+        if fix:
+            self._check_write()
         warnings = (shard.check(fix, retry) for shard in self._shards)
         return functools.reduce(operator.iadd, warnings, [])
 
@@ -428,6 +489,7 @@ class FanoutCache:
         :raises Timeout: if database timeout occurs
 
         """
+        self._check_write()
         for shard in self._shards:
             shard.create_tag_index()
 
@@ -437,6 +499,7 @@ class FanoutCache:
         :raises Timeout: if database timeout occurs
 
         """
+        self._check_write()
         for shard in self._shards:
             shard.drop_tag_index()
 
@@ -499,6 +562,8 @@ class FanoutCache:
         :return: (hits, misses)
 
         """
+        if enable or reset:
+            self._check_write()
         results = [shard.stats(enable, reset) for shard in self._shards]
         total_hits = sum(hits for hits, _ in results)
         total_misses = sum(misses for _, misses in results)
@@ -564,6 +629,8 @@ class FanoutCache:
         :return: updated value for item
 
         """
+        if value is not ENOVAL or key == 'statistics':
+            self._check_write()
         for shard in self._shards:
             while True:
                 try:
