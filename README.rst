@@ -76,6 +76,7 @@ Features
 - Django compatible API
 - Thread-safe and process-safe
 - Supports multiple eviction policies (LRU and LFU included)
+- Idle TTL with hard deadline renewal policy
 - Keys support "tag" metadata and eviction
 - Developed on Python 3.10
 - Tested on CPython 3.6, 3.7, 3.8, 3.9, 3.10

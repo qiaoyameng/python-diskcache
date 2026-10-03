@@ -99,7 +99,17 @@ class FanoutCache:
                 stack.enter_context(shard_transaction)
             yield
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        idle_ttl=None,
+        hard_ttl=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
@@ -115,13 +125,20 @@ class FanoutCache:
         :param bool read: read value as raw bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle_ttl: seconds of idleness after which item expires;
+            successful reads renew the idle deadline (default None, no idle
+            expiry)
+        :param float hard_ttl: maximum seconds the item is kept, regardless
+            of accesses (default None, no hard deadline)
         :return: True if item was set
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.set(key, value, expire, read, tag, retry)
+            return shard.set(
+                key, value, expire, read, tag, retry, idle_ttl, hard_ttl
+            )
         except Timeout:
             return False
 
@@ -158,7 +175,17 @@ class FanoutCache:
         except Timeout:
             return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        idle_ttl=None,
+        hard_ttl=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -179,13 +206,20 @@ class FanoutCache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param float idle_ttl: seconds of idleness after which item expires;
+            successful reads renew the idle deadline (default None, no idle
+            expiry)
+        :param float hard_ttl: maximum seconds the item is kept, regardless
+            of accesses (default None, no hard deadline)
         :return: True if item was added
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.add(key, value, expire, read, tag, retry)
+            return shard.add(
+                key, value, expire, read, tag, retry, idle_ttl, hard_ttl
+            )
         except Timeout:
             return False
 

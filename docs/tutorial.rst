@@ -139,6 +139,22 @@ the cache.
     >>> cache.touch('does-not-exist', expire=1)
     False
 
+Items may also be stored with an idle TTL and a hard deadline using the
+`idle_ttl` and `hard_ttl` parameters of :meth:`set <diskcache.Cache.set>`,
+:meth:`add <diskcache.Cache.add>`, and :meth:`push <diskcache.Cache.push>`.
+Successful reads renew the idle deadline while the hard deadline caps the
+lifetime of the item no matter how often it is accessed. The effective
+expiration time is the earlier of the two. Reads that miss, find an expired
+item, or fail to read the value do not renew the idle deadline, and neither
+do the :meth:`peek <diskcache.Cache.peek>` and :meth:`peekitem
+<diskcache.Cache.peekitem>` methods. Renewal writes are throttled by
+``Cache.idle_refresh_factor`` (default 0.1) so that very hot keys do not
+cause a database write on every read; the idle deadline may therefore expire
+an item at most ``idle_ttl * idle_refresh_factor`` seconds early. Deadlines
+are stored as seconds from the epoch so they are interpreted consistently
+across processes, and the clock may be injected with the ``clock`` parameter
+of :class:`Cache <diskcache.Cache>` for testing.
+
 Like :meth:`set <diskcache.Cache.set>`, the method :meth:`add
 <diskcache.Cache.add>` can be used to insert an item in the cache. The item is
 inserted only if the key is not already present.
