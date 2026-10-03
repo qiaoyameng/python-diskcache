@@ -48,6 +48,12 @@ Index
    :special-members:
    :exclude-members: __weakref__
 
+ScheduledQueue
+--------------
+
+.. autoclass:: diskcache.ScheduledQueue
+   :members:
+
 Recipes
 -------
 

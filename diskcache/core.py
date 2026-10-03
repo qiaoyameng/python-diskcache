@@ -1934,7 +1934,15 @@ class Cache:
 
                 rows = sql(select).fetchall()
 
-                for rowid, size, filename in rows:
+                try:
+                    scheduled_rows = sql(
+                        'SELECT rowid, size, filename FROM ScheduledQueue'
+                        ' WHERE filename IS NOT NULL'
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    scheduled_rows = []
+
+                def check_row(rowid, size, filename, table):
                     full_path = op.join(self._directory, filename)
                     filenames.add(full_path)
 
@@ -1948,17 +1956,26 @@ class Cache:
 
                             if fix:
                                 sql(
-                                    'UPDATE Cache SET size = ?'
-                                    ' WHERE rowid = ?',
+                                    'UPDATE {0} SET size = ?'
+                                    ' WHERE rowid = ?'.format(table),
                                     (real_size, rowid),
                                 )
 
-                        continue
+                        return
 
                     warnings.warn('file not found: %s' % full_path)
 
                     if fix:
-                        sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+                        sql(
+                            'DELETE FROM {0} WHERE rowid = ?'.format(table),
+                            (rowid,),
+                        )
+
+                for rowid, size, filename in rows:
+                    check_row(rowid, size, filename, 'Cache')
+
+                for rowid, size, filename in scheduled_rows:
+                    check_row(rowid, size, filename, 'ScheduledQueue')
 
                 # Check file system against Cache.filename.
 

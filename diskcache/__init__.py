@@ -19,6 +19,7 @@ from .core import (
 )
 from .fanout import FanoutCache
 from .persistent import Deque, Index
+from .scheduled import ScheduledQueue
 from .recipes import (
     Averager,
     BoundedSemaphore,
@@ -44,6 +45,7 @@ __all__ = [
     'JSONDisk',
     'Lock',
     'RLock',
+    'ScheduledQueue',
     'Timeout',
     'UNKNOWN',
     'UnknownFileWarning',
